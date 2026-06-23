@@ -1585,7 +1585,8 @@ export const ja = defineLocale({
       branchOffFrom: base => `${base} から新しいブランチ`,
       switchTo: branch => `${branch} に切り替え`,
       switchFailed: branch => `${branch} に切り替えできませんでした`,
-      worktrees: 'ワークツリー'
+      worktrees: 'ワークツリー',
+      inFolder: folder => `フォルダ ${folder} 内`
     }
   },
 

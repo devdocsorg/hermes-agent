@@ -27,6 +27,13 @@ import { gitRef } from '@/lib/sanitize'
 import { $repoStatus, $repoWorktrees } from '@/store/coding-status'
 import { notifyError } from '@/store/notifications'
 import { $newWorktreeRequest } from '@/store/projects'
+import { $currentCwd } from '@/store/session'
+
+// Branch/worktree-dir comparison key: lowercase, separators (`/`, `:`, …) and
+// any other punctuation collapsed to one `-`. Lets `feat/x` read as matching an
+// `x` or `feat-x` checkout dir, so we only surface the folder on a real mismatch.
+const slug = (value: string) =>
+  value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
 
 // Tiny uppercase section header, matching the composer "+" menu's labels.
 const MENU_SECTION = 'text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)'
@@ -63,6 +70,7 @@ export const CodingStatusRow = memo(function CodingStatusRow({
   const p = t.sidebar.projects
   const status = useStore($repoStatus)
   const worktrees = useStore($repoWorktrees)
+  const cwd = useStore($currentCwd)
 
   const [branchOpen, setBranchOpen] = useState(false)
   const [branchName, setBranchName] = useState('')
@@ -138,6 +146,20 @@ export const CodingStatusRow = memo(function CodingStatusRow({
   }
 
   const branchLabel = status.detached ? s.detached : status.branch || s.noBranch
+  // Surface the checkout FOLDER only when it doesn't match the branch — a
+  // session on `ethie/faster-docker` sitting in a dir called `hermes-agent`
+  // (the main worktree) reads as "on main" without it. A worktree dir named for
+  // its branch (`feat/x` in `feat-x` or `x`) matches and stays quiet.
+  const folderName = (cwd || '').split(/[\\/]+/).filter(Boolean).pop() || ''
+  const branchSlug = status.detached ? '' : slug(status.branch || '')
+  const folderSlug = slug(folderName)
+
+  const showFolder =
+    !!folderName &&
+    !!branchSlug &&
+    folderSlug !== branchSlug &&
+    folderSlug !== slug((status.branch || '').split('/').pop() || '')
+
   // The kebab offers branching off the trunk and/or the current branch. The
   // worktree-add bases the new branch on `base` (a branch name; undefined =
   // current HEAD). We dedupe so "on main" shows a single trunk entry, and fall
@@ -186,12 +208,22 @@ export const CodingStatusRow = memo(function CodingStatusRow({
         onActivate={onOpen}
       >
         <div className="flex min-w-0 flex-1 items-center gap-1">
-          <span
-            className="min-w-0 truncate text-xs font-normal text-muted-foreground/92 transition-colors group-hover/status-row:text-foreground/90"
-            title={branchLabel}
-          >
-            {branchLabel}
-          </span>
+          <div className="flex min-w-0 flex-col">
+            <span
+              className="min-w-0 truncate text-xs font-normal text-muted-foreground/92 transition-colors group-hover/status-row:text-foreground/90"
+              title={branchLabel}
+            >
+              {branchLabel}
+            </span>
+            {showFolder && (
+              <span
+                className="min-w-0 truncate text-[0.625rem] leading-tight text-(--ui-text-tertiary)"
+                title={folderName}
+              >
+                {s.inFolder(folderName)}
+              </span>
+            )}
+          </div>
 
           {/* Branch actions kebab — same pattern as the session/worktree rows.
               ALWAYS laid out; only its opacity flips on hover/focus/open, so

@@ -1535,7 +1535,8 @@ export const zhHant = defineLocale({
       branchOffFrom: base => `從 ${base} 建立新分支`,
       switchTo: branch => `切換到 ${branch}`,
       switchFailed: branch => `無法切換到 ${branch}`,
-      worktrees: '工作樹'
+      worktrees: '工作樹',
+      inFolder: folder => `位於資料夾 ${folder}`
     }
   },
 
