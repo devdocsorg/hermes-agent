@@ -107,24 +107,15 @@ def _notification_scope_ids(
 
     observed_thread_id = params.get("threadId") or params.get("thread_id")
     if observed_thread_id is None and isinstance(nested_turn, dict):
-        observed_thread_id = (
-            nested_turn.get("threadId")
-            or nested_turn.get("thread_id")
-        )
+        observed_thread_id = nested_turn.get("threadId") or nested_turn.get("thread_id")
     if observed_thread_id is None and isinstance(nested_item, dict):
-        observed_thread_id = (
-            nested_item.get("threadId")
-            or nested_item.get("thread_id")
-        )
+        observed_thread_id = nested_item.get("threadId") or nested_item.get("thread_id")
 
     observed_turn_id = params.get("turnId") or params.get("turn_id")
     if observed_turn_id is None and isinstance(nested_turn, dict):
         observed_turn_id = nested_turn.get("id") or nested_turn.get("turnId")
     if observed_turn_id is None and isinstance(nested_item, dict):
-        observed_turn_id = (
-            nested_item.get("turnId")
-            or nested_item.get("turn_id")
-        )
+        observed_turn_id = nested_item.get("turnId") or nested_item.get("turn_id")
 
     return observed_thread_id, observed_turn_id
 
@@ -228,15 +219,22 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
 )
 
 
-def _classify_oauth_failure(*parts: str) -> Optional[str]:
+def _classify_oauth_failure(
+    *parts: str,
+    oauth_auth_expected: bool = True,
+) -> Optional[str]:
     """Return a user-friendly re-auth hint if any of the provided strings
     look like a codex OAuth/token-refresh failure; otherwise None.
 
     Used for both `turn/start` JSON-RPC errors and post-mortem stderr
     inspection when the subprocess exits unexpectedly. Conservative on
     purpose — we only redirect users to `codex login` when the signal
-    is strong, so unrelated runtime failures still surface verbatim.
+    is strong and this session expects Codex OAuth. Custom providers can
+    return ordinary API-key 401s (for example, LiteLLM virtual-key errors),
+    which must surface verbatim instead of suggesting `codex login`.
     """
+    if not oauth_auth_expected:
+        return None
     haystack = " ".join(p for p in parts if p).lower()
     if not haystack:
         return None
@@ -279,6 +277,8 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+        oauth_auth_expected: bool = True,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -288,8 +288,11 @@ class CodexAppServerSession:
         self._resume_thread_id = str(resume_thread_id or "").strip() or None
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._env = dict(env) if env else None
+        self._oauth_auth_expected = oauth_auth_expected
         self._permission_profile = (
-            permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
+            permission_profile
+            or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
                 "workspace-write",
             )
@@ -322,7 +325,9 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                env=self._env,
             )
         self._client.initialize(
             client_name="hermes",
@@ -433,7 +438,9 @@ class CodexAppServerSession:
         except (CodexAppServerError, TimeoutError):
             logger.debug("turn/steer rejected for active Codex turn", exc_info=True)
             return False
-        accepted_turn_id = response.get("turnId") if isinstance(response, dict) else None
+        accepted_turn_id = (
+            response.get("turnId") if isinstance(response, dict) else None
+        )
         return accepted_turn_id in {None, turn_id}
 
     # ---------- diagnostics ----------
@@ -541,7 +548,11 @@ class CodexAppServerSession:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(exc.message, stderr_blob)
+            hint = _classify_oauth_failure(
+                exc.message,
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             if hint is not None:
                 result.error = hint
                 # Subprocess is fine on a JSON-RPC level here, but the
@@ -550,15 +561,16 @@ class CodexAppServerSession:
                 # via `codex login` between turns).
                 result.should_retire = True
             else:
-                result.error = self._format_error_with_stderr(
-                    "turn/start failed", exc
-                )
+                result.error = self._format_error_with_stderr("turn/start failed", exc)
             self._interrupt_event.clear()
             return result
         except TimeoutError as exc:
             # turn/start hanging is a strong signal the subprocess is wedged.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(stderr_blob)
+            hint = _classify_oauth_failure(
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             result.error = hint or self._format_error_with_stderr(
                 "turn/start timed out", exc
             )
@@ -589,7 +601,10 @@ class CodexAppServerSession:
             # rather than waiting for the full turn deadline.
             if not self._client.is_alive():
                 stderr_blob = "\n".join(self._client.stderr_tail(60))
-                hint = _classify_oauth_failure(stderr_blob)
+                hint = _classify_oauth_failure(
+                    stderr_blob,
+                    oauth_auth_expected=self._oauth_auth_expected,
+                )
                 if hint is not None:
                     result.error = hint
                 else:
@@ -606,7 +621,7 @@ class CodexAppServerSession:
             if (
                 last_tool_completion_at is not None
                 and (time.monotonic() - last_tool_completion_at)
-                    > post_tool_quiet_timeout
+                > post_tool_quiet_timeout
             ):
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -652,9 +667,7 @@ class CodexAppServerSession:
                         try:
                             self._on_event(pending)
                         except Exception:  # pragma: no cover - display callback
-                            logger.debug(
-                                "on_event callback raised", exc_info=True
-                            )
+                            logger.debug("on_event callback raised", exc_info=True)
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
@@ -669,19 +682,14 @@ class CodexAppServerSession:
                         if _has_turn_aborted_marker(proj.final_text):
                             turn_complete = True
                             result.interrupted = True
-                            result.error = (
-                                result.error
-                                or "codex reported turn_aborted"
-                            )
+                            result.error = result.error or "codex reported turn_aborted"
                 self._handle_server_request(sreq)
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
                 last_tool_completion_at = None
                 continue
 
-            note = self._client.take_notification(
-                timeout=notification_poll_timeout
-            )
+            note = self._client.take_notification(timeout=notification_poll_timeout)
             if note is None:
                 continue
 
@@ -691,9 +699,7 @@ class CodexAppServerSession:
                 thread_id=self._thread_id,
                 turn_id=result.turn_id,
             ):
-                logger.debug(
-                    "ignoring foreign codex notification: method=%s", method
-                )
+                logger.debug("ignoring foreign codex notification: method=%s", method)
                 continue
 
             if self._on_event is not None:
@@ -737,28 +743,28 @@ class CodexAppServerSession:
                 if _has_turn_aborted_marker(projection.final_text):
                     turn_complete = True
                     result.interrupted = True
-                    result.error = (
-                        result.error or "codex reported turn_aborted"
-                    )
+                    result.error = result.error or "codex reported turn_aborted"
 
             if method == "turn/completed":
                 turn_complete = True
-                turn_status = (
-                    (note.get("params") or {}).get("turn") or {}
-                ).get("status")
+                turn_status = ((note.get("params") or {}).get("turn") or {}).get(
+                    "status"
+                )
                 if turn_status and turn_status not in {"completed", "interrupted"}:
-                    err_obj = (
-                        (note.get("params") or {}).get("turn") or {}
-                    ).get("error")
+                    err_obj = ((note.get("params") or {}).get("turn") or {}).get(
+                        "error"
+                    )
                     if err_obj:
                         err_msg = _format_responses_error(err_obj, str(turn_status))
                         # If the turn failed for an auth/refresh reason,
                         # rewrite the error into a re-auth hint AND mark
                         # the session for retirement.
-                        stderr_blob = "\n".join(
-                            self._client.stderr_tail(40)
+                        stderr_blob = "\n".join(self._client.stderr_tail(40))
+                        hint = _classify_oauth_failure(
+                            err_msg,
+                            stderr_blob,
+                            oauth_auth_expected=self._oauth_auth_expected,
                         )
-                        hint = _classify_oauth_failure(err_msg, stderr_blob)
                         if hint is not None:
                             result.error = hint
                             result.should_retire = True
@@ -834,7 +840,11 @@ class CodexAppServerSession:
             )
         except CodexAppServerError as exc:
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(exc.message, stderr_blob)
+            hint = _classify_oauth_failure(
+                exc.message,
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             if hint is not None:
                 result.error = hint
                 result.should_retire = True
@@ -845,7 +855,10 @@ class CodexAppServerSession:
             return result
         except TimeoutError as exc:
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(stderr_blob)
+            hint = _classify_oauth_failure(
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             result.error = hint or self._format_error_with_stderr(
                 "thread/compact/start timed out", exc
             )
@@ -863,7 +876,10 @@ class CodexAppServerSession:
 
             if not self._client.is_alive():
                 stderr_blob = "\n".join(self._client.stderr_tail(60))
-                hint = _classify_oauth_failure(stderr_blob)
+                hint = _classify_oauth_failure(
+                    stderr_blob,
+                    oauth_auth_expected=self._oauth_auth_expected,
+                )
                 if hint is not None:
                     result.error = hint
                 else:
@@ -879,9 +895,7 @@ class CodexAppServerSession:
                 self._handle_server_request(sreq)
                 continue
 
-            note = self._client.take_notification(
-                timeout=notification_poll_timeout
-            )
+            note = self._client.take_notification(timeout=notification_poll_timeout)
             if note is None:
                 continue
 
@@ -889,19 +903,16 @@ class CodexAppServerSession:
             observed_thread_id, observed_turn_id = _notification_scope_ids(note)
             if result.turn_id is None:
                 if method == "turn/started":
-                    if (
-                        observed_thread_id is not None
-                        and str(observed_thread_id) != str(self._thread_id)
-                    ):
+                    if observed_thread_id is not None and str(
+                        observed_thread_id
+                    ) != str(self._thread_id):
                         logger.debug(
                             "ignoring foreign compact turn/started: thread=%s",
                             observed_thread_id,
                         )
                         continue
                     if observed_turn_id is None:
-                        logger.debug(
-                            "ignoring compact turn/started without a turn id"
-                        )
+                        logger.debug("ignoring compact turn/started without a turn id")
                         continue
                     result.turn_id = str(observed_turn_id)
                 elif observed_turn_id is not None or method in {
@@ -923,9 +934,7 @@ class CodexAppServerSession:
                 thread_id=self._thread_id,
                 turn_id=result.turn_id,
             ):
-                logger.debug(
-                    "ignoring foreign codex notification: method=%s", method
-                )
+                logger.debug("ignoring foreign codex notification: method=%s", method)
                 continue
 
             if self._on_event is not None:
@@ -948,9 +957,7 @@ class CodexAppServerSession:
                 if _has_turn_aborted_marker(projection.final_text):
                     turn_complete = True
                     result.interrupted = True
-                    result.error = (
-                        result.error or "codex reported turn_aborted"
-                    )
+                    result.error = result.error or "codex reported turn_aborted"
 
             if method == "turn/started":
                 turn_obj = (note.get("params") or {}).get("turn") or {}
@@ -967,7 +974,11 @@ class CodexAppServerSession:
                     err_obj = turn_obj.get("error")
                     err_msg = _format_responses_error(err_obj, str(turn_status))
                     stderr_blob = "\n".join(self._client.stderr_tail(40))
-                    hint = _classify_oauth_failure(err_msg, stderr_blob)
+                    hint = _classify_oauth_failure(
+                        err_msg,
+                        stderr_blob,
+                        oauth_auth_expected=self._oauth_auth_expected,
+                    )
                     if hint is not None:
                         result.error = hint
                         result.should_retire = True
@@ -1111,8 +1122,10 @@ class CodexAppServerSession:
                 else "Codex requests to apply a patch"
             )
             command_label = (
-                f"apply_patch: {change_summary}" if change_summary
-                else f"apply_patch: {reason}" if reason
+                f"apply_patch: {change_summary}"
+                if change_summary
+                else f"apply_patch: {reason}"
+                if reason
                 else "apply_patch"
             )
             try:
@@ -1242,7 +1255,9 @@ def _approval_choice_to_codex_decision(choice: str) -> str:
     (verified against codex-rs/app-server-protocol/src/protocol/v2/item.rs
     on codex 0.130.0).
     """
-    if choice in {"once",}:
+    if choice in {
+        "once",
+    }:
         return "accept"
     if choice in {"session", "always"}:
         return "acceptForSession"

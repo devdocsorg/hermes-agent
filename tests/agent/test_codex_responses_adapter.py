@@ -125,10 +125,12 @@ def test_normalize_codex_response_ignores_in_progress_server_side_tool_calls():
                 type="message",
                 role="assistant",
                 status="completed",
-                content=[SimpleNamespace(
-                    type="output_text",
-                    text="Milwaukee M18 blade 49-16-2734, ~$30 OEM.",
-                )],
+                content=[
+                    SimpleNamespace(
+                        type="output_text",
+                        text="Milwaukee M18 blade 49-16-2734, ~$30 OEM.",
+                    )
+                ],
             ),
             SimpleNamespace(type="web_search_call", status="in_progress"),
             SimpleNamespace(type="web_search_call", status="in_progress"),
@@ -228,37 +230,74 @@ def test_chat_messages_to_responses_input_keeps_short_message_id():
 
 
 def test_preflight_codex_input_items_drops_oversized_message_id():
-    items = _preflight_codex_input_items(
-        [
-            {
-                "type": "message",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": "pong"}],
-                "id": _OVERSIZED_ITEM_ID,
-                "phase": "final_answer",
-            }
-        ]
-    )
+    items = _preflight_codex_input_items([
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "pong"}],
+            "id": _OVERSIZED_ITEM_ID,
+            "phase": "final_answer",
+        }
+    ])
 
     assert "id" not in items[0]
     assert items[0]["phase"] == "final_answer"
 
 
 def test_preflight_codex_input_items_keeps_short_message_id():
-    items = _preflight_codex_input_items(
-        [
-            {
-                "type": "message",
-                "role": "assistant",
-                "status": "completed",
-                "content": [{"type": "output_text", "text": "pong"}],
-                "id": _VALID_ITEM_ID,
-            }
-        ]
-    )
+    items = _preflight_codex_input_items([
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "pong"}],
+            "id": _VALID_ITEM_ID,
+        }
+    ])
 
     assert items[0]["id"] == _VALID_ITEM_ID
+
+
+def test_preflight_codex_input_items_drops_invalid_historical_function_call_pair():
+    items = _preflight_codex_input_items([
+        {
+            "type": "function_call",
+            "call_id": "call_old",
+            "name": "mcp:legacy/tool",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_old",
+            "output": "old result",
+        },
+        {
+            "type": "function_call",
+            "call_id": "call_current",
+            "name": "mcp__gbrain__get_stats",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_current",
+            "output": "current result",
+        },
+    ])
+
+    assert items == [
+        {
+            "type": "function_call",
+            "call_id": "call_current",
+            "name": "mcp__gbrain__get_stats",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_current",
+            "output": "current result",
+        },
+    ]
 
 
 def test_preflight_codex_input_items_drops_short_id_for_github_responses():
@@ -283,27 +322,27 @@ def test_preflight_codex_input_items_drops_short_id_for_github_responses():
 
 
 def test_preflight_codex_api_kwargs_drops_oversized_message_id_end_to_end():
-    kwargs = _preflight_codex_api_kwargs(
-        {
-            "model": "gpt-5.5",
-            "instructions": "You are Hermes.",
-            "input": [
-                {"role": "user", "content": "ping"},
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": "pong"}],
-                    "id": _OVERSIZED_ITEM_ID,
-                    "phase": "final_answer",
-                },
-            ],
-            "tools": [],
-            "store": False,
-        }
-    )
+    kwargs = _preflight_codex_api_kwargs({
+        "model": "gpt-5.5",
+        "instructions": "You are Hermes.",
+        "input": [
+            {"role": "user", "content": "ping"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "pong"}],
+                "id": _OVERSIZED_ITEM_ID,
+                "phase": "final_answer",
+            },
+        ],
+        "tools": [],
+        "store": False,
+    })
 
-    message_item = next(item for item in kwargs["input"] if item.get("type") == "message")
+    message_item = next(
+        item for item in kwargs["input"] if item.get("type") == "message"
+    )
     assert "id" not in message_item
 
 
@@ -323,15 +362,21 @@ def test_preflight_passes_native_web_search_tool_through():
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
         "store": False,
         "tools": [
-            {"type": "function", "name": "read_file", "description": "Read.",
-             "parameters": {"type": "object", "properties": {}}},
+            {
+                "type": "function",
+                "name": "read_file",
+                "description": "Read.",
+                "parameters": {"type": "object", "properties": {}},
+            },
             {"type": "web_search"},
         ],
     }
     out = _preflight_codex_api_kwargs(kwargs, allow_stream=True)
     tools = out["tools"]
     assert {"type": "web_search"} in tools
-    assert any(t.get("type") == "function" and t.get("name") == "read_file" for t in tools)
+    assert any(
+        t.get("type") == "function" and t.get("name") == "read_file" for t in tools
+    )
 
 
 def test_preflight_still_rejects_unknown_tool_type():

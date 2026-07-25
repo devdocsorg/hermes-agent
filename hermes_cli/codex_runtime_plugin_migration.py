@@ -47,12 +47,8 @@ logger = logging.getLogger(__name__)
 
 # Marker comments wrapping the managed section so re-runs can detect
 # what's ours and what's user-edited. Both must appear or strip is a no-op.
-MIGRATION_MARKER = (
-    "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section"
-)
-MIGRATION_END_MARKER = (
-    "# end hermes-agent managed section"
-)
+MIGRATION_MARKER = "# managed by hermes-agent — `hermes codex-runtime migrate` regenerates this section"
+MIGRATION_END_MARKER = "# end hermes-agent managed section"
 
 
 @dataclass
@@ -79,9 +75,7 @@ class MigrationReport:
             lines.append(f"Migrated {len(self.migrated)} MCP server(s):")
             for name in self.migrated:
                 skipped = self.skipped_keys_per_server.get(name, [])
-                note = (
-                    f" (skipped: {', '.join(skipped)})" if skipped else ""
-                )
+                note = f" (skipped: {', '.join(skipped)})" if skipped else ""
                 lines.append(f"  - {name}{note}")
         else:
             lines.append("No MCP servers found in Hermes config.")
@@ -95,8 +89,7 @@ class MigrationReport:
             lines.append(f"Codex plugin discovery skipped: {self.plugin_query_error}")
         if self.wrote_permissions_default:
             lines.append(
-                f"Wrote default_permissions = "
-                f"{self.wrote_permissions_default!r}"
+                f"Wrote default_permissions = {self.wrote_permissions_default!r}"
             )
         for err in self.errors:
             lines.append(f"⚠ {err}")
@@ -108,13 +101,20 @@ class MigrationReport:
 # transport keys is added to skipped.
 _KNOWN_HERMES_KEYS = {
     # transport — stdio
-    "command", "args", "env", "cwd",
+    "command",
+    "args",
+    "env",
+    "cwd",
     # transport — http
-    "url", "headers", "transport",
+    "url",
+    "headers",
+    "transport",
     # timeouts
-    "timeout", "connect_timeout",
+    "timeout",
+    "connect_timeout",
     # general
-    "enabled", "description",
+    "enabled",
+    "description",
 }
 
 # Subset that have a direct codex equivalent.
@@ -230,7 +230,7 @@ def _format_toml_value(value: Any) -> str:
         return f"[{items}]"
     if isinstance(value, dict):
         items = ", ".join(
-            f'{_quote_key(k)} = {_format_toml_value(v)}' for k, v in value.items()
+            f"{_quote_key(k)} = {_format_toml_value(v)}" for k, v in value.items()
         )
         return "{ " + items + " }" if items else "{}"
     raise ValueError(f"Unsupported TOML value type: {type(value).__name__}")
@@ -242,6 +242,7 @@ def _quote_key(key: str) -> str:
         return key
     escaped = key.replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
+
 
 def render_codex_toml_section(
     servers: dict[str, dict],
@@ -290,13 +291,15 @@ def render_codex_toml_section(
                 out.append(f"{_quote_key(k)} = {_format_toml_value(v)}")
 
     if plugins:
-        for plugin in sorted(plugins, key=lambda p: f"{p.get('name','')}@{p.get('marketplace','')}"):
+        for plugin in sorted(
+            plugins, key=lambda p: f"{p.get('name', '')}@{p.get('marketplace', '')}"
+        ):
             name = plugin.get("name") or ""
             marketplace = plugin.get("marketplace") or "openai-curated"
             enabled = bool(plugin.get("enabled", True))
             qualified = f"{name}@{marketplace}"
             out.append("")
-            out.append(f'[plugins.{_quote_key(qualified)}]')
+            out.append(f"[plugins.{_quote_key(qualified)}]")
             out.append(f"enabled = {_format_toml_value(enabled)}")
 
     out.append("")
@@ -430,11 +433,15 @@ def _strip_existing_managed_block(toml_text: str) -> str:
                 saw_end_marker = True
                 continue
             stripped = line.lstrip()
-            if not saw_end_marker and stripped.startswith("[") and not (
-                stripped.startswith("[mcp_servers")
-                or stripped.startswith("[plugins")
-                or stripped.startswith("[permissions]")
-                or stripped.startswith("[permissions.")
+            if (
+                not saw_end_marker
+                and stripped.startswith("[")
+                and not (
+                    stripped.startswith("[mcp_servers")
+                    or stripped.startswith("[plugins")
+                    or stripped.startswith("[permissions]")
+                    or stripped.startswith("[permissions.")
+                )
             ):
                 # Old-format managed block without end marker: bail back
                 # to user content as soon as we see a non-managed section.
@@ -507,7 +514,8 @@ def _query_codex_plugins(
             if availability and availability != "AVAILABLE":
                 logger.debug(
                     "skipping plugin %s: availability=%s",
-                    plugin.get("name"), availability,
+                    plugin.get("name"),
+                    availability,
                 )
                 continue
             name = str(plugin.get("name") or "")
@@ -612,7 +620,7 @@ def migrate(
     codex_home: Optional[Path] = None,
     dry_run: bool = False,
     discover_plugins: bool = True,
-    default_permission_profile: Optional[str] = ":workspace",
+    default_permission_profile: Optional[str] = ":danger-full-access",
     expose_hermes_tools: bool = True,
 ) -> MigrationReport:
     """Translate Hermes mcp_servers config + Codex curated plugins into
@@ -626,11 +634,11 @@ def migrate(
             the live codex CLI to migrate any installed curated plugins
             into [plugins."<name>@<marketplace>"] entries. Set False to
             skip the subprocess spawn (for tests or restricted environments).
-        default_permission_profile: when set (default ":workspace"), write
+        default_permission_profile: when set (default ":danger-full-access"), write
             top-level `default_permissions = "<name>"` so users on this
             runtime don't get an approval prompt on every write attempt.
-            Built-in codex profile names are ":workspace", ":read-only",
-            ":danger-no-sandbox" (note the leading ":"). Also accepts a
+            Built-in Codex profile names are ":workspace", ":read-only", and
+            ":danger-full-access" (note the leading ":"). Also accepts a
             user-defined profile name (no leading ":") that the user has
             configured in their own [permissions.<name>] table. Set None
             to leave permissions unset and let codex use its compiled-in
@@ -700,7 +708,8 @@ def migrate(
 
     # Build the new managed block
     managed_block = render_codex_toml_section(
-        translated, plugins=plugins,
+        translated,
+        plugins=plugins,
         default_permission_profile=default_permission_profile,
     )
 
@@ -735,6 +744,7 @@ def migrate(
         # on Windows. Avoids leaving a half-written config.toml that
         # codex would refuse to load if we crash mid-write.
         import tempfile
+
         tmp_fd, tmp_path_str = tempfile.mkstemp(
             prefix=".config.toml.", dir=str(codex_home)
         )
