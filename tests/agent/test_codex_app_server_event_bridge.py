@@ -444,6 +444,17 @@ class TestAgentMessageInterimDispatch:
             {"role": "assistant", "content": "I'll check the config first."}
         )
 
+    def test_final_answer_agent_message_does_not_emit_interim(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_completed({
+            "type": "agentMessage",
+            "id": "am-final",
+            "text": "Done.",
+            "phase": "final_answer",
+        }))
+        agent._emit_interim_assistant_message.assert_not_called()
+
     def test_empty_text_does_not_emit_interim(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)

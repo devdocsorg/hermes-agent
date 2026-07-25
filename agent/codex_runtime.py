@@ -441,11 +441,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
       * ``item/agentMessage/delta`` → ``_fire_stream_delta(text)`` so chat
         adapters can render the assistant's reply as it streams.
       * ``item/reasoning/delta`` → ``_fire_reasoning_delta(text)``
-      * ``item/completed`` for ``agentMessage`` →
+      * ``item/completed`` for non-final ``agentMessage`` items →
         ``_emit_interim_assistant_message({"role": "assistant",
-        "content": text})``. The gateway's ``already_streamed`` check
-        dedupes against any text the stream-delta callback already
-        rendered for the same message.
+        "content": text})``. ``phase=final_answer`` is left to the normal
+        final-delivery path so gateway platforms do not post it twice.
 
     All callback invocations are guarded — a buggy display callback must
     not tear down the codex turn loop. Errors are logged at DEBUG so the
@@ -568,6 +567,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         text = item.get("text") or ""
         if not isinstance(text, str) or not text.strip():
             return
+        phase = item.get("phase")
+        if isinstance(phase, str) and phase.strip().lower() == "final_answer":
+            return
         # display.show_commentary=false — mid-turn narration stays off the
         # visible interim path on this runtime too (same contract as the
         # codex_responses commentary channel).
@@ -679,6 +681,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            resume_thread_id=getattr(agent, "codex_resume_thread_id", None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

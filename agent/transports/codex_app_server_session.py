@@ -275,6 +275,7 @@ class CodexAppServerSession:
         self,
         *,
         cwd: Optional[str] = None,
+        resume_thread_id: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
@@ -284,6 +285,7 @@ class CodexAppServerSession:
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        self._resume_thread_id = str(resume_thread_id or "").strip() or None
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = (
@@ -342,8 +344,15 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        if self._resume_thread_id:
+            params: dict[str, Any] = {
+                "threadId": self._resume_thread_id,
+                "cwd": self._cwd,
+            }
+            result = self._client.request("thread/resume", params, timeout=15)
+        else:
+            params = {"cwd": self._cwd}
+            result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -365,7 +374,8 @@ class CodexAppServerSession:
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if self._resume_thread_id else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,

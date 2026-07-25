@@ -19934,6 +19934,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         from run_agent import AIAgent
+
+        # A Slack root thread is a durable conversation lane. When it is bound
+        # to a project, seed Codex with that project CWD and restore the native
+        # Codex task previously created for the same Slack thread.
+        try:
+            from gateway.codex_slack_bridge import resolve_binding
+
+            _codex_bridge = resolve_binding(
+                source,
+                getattr(self._session_db, "_db", self._session_db),
+            )
+        except Exception:
+            logger.debug("Codex Slack bridge resolution failed", exc_info=True)
+            _codex_bridge = None
         import queue
 
         def _run_still_current() -> bool:
@@ -20043,7 +20057,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
-        tool_progress_enabled = progress_mode not in {"off", "log"} and source.platform != Platform.WEBHOOK
+        tool_progress_enabled = (
+            progress_mode not in {"off", "log"}
+            and source.platform != Platform.WEBHOOK
+            and _codex_bridge is None
+        )
         # Live working-state status for text-rendering typing indicators
         # (Slack's assistant status line). Independent of tool_progress —
         # Slack defaults tool_progress off (permanent lines spam channels)
@@ -20057,11 +20075,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _live_status_adapter = self._adapter_for_source(source)
         if not getattr(_live_status_adapter, "supports_status_text", False):
             _live_status_adapter = None
-        if _live_status_mode == "off":
+        if _live_status_mode == "off" or _codex_bridge is not None:
             _live_status_adapter = None
         # "log" mode: tool calls are written to ~/.hermes/logs/tool_calls.log
         # instead of the chat (#3459 / #3458). Gateway-only by design.
-        log_mode_enabled = progress_mode == "log" and source.platform != Platform.WEBHOOK
+        log_mode_enabled = (
+            progress_mode == "log"
+            and source.platform != Platform.WEBHOOK
+            and _codex_bridge is None
+        )
         log_queue: "queue.Queue | None" = queue.Queue() if log_mode_enabled else None
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
@@ -20074,6 +20096,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         interim_assistant_messages_enabled = (
             source.platform != Platform.WEBHOOK
             and interim_assistant_messages_mode != "off"
+            and _codex_bridge is None
         )
         # thinking_progress is independent — if enabled, we need the progress
         # queue even when tool_progress is off (thinking relay uses same infra).
@@ -20084,7 +20107,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default=False,
             require_platform_override_for={Platform.MATTERMOST},
         )
-        _thinking_enabled = _thinking_mode != "off"
+        _thinking_enabled = _thinking_mode != "off" and _codex_bridge is None
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
 
@@ -21057,6 +21080,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            if _codex_bridge is not None:
+                _streaming_enabled = False
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
@@ -21413,6 +21438,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            if _codex_bridge is not None:
+                agent.session_cwd = _codex_bridge.cwd
+                agent.codex_resume_thread_id = _codex_bridge.codex_thread_id
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -21440,7 +21469,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-            agent.status_callback = _status_callback_sync
+            agent.status_callback = (
+                None if _codex_bridge is not None else _status_callback_sync
+            )
             # Credits / out-of-band notices (usage bands, depletion, restored).
             # Messaging has no persistent status bar, so each notice is a
             # standalone push: render to a single plaintext line and deliver via
@@ -21470,7 +21501,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="notice_callback delivery scheduling error",
                 )
 
-            agent.notice_callback = _notice_callback_sync
+            agent.notice_callback = (
+                None if _codex_bridge is not None else _notice_callback_sync
+            )
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
@@ -21522,7 +21555,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             return
                 _deliver_bg_review_message(message)
 
-            agent.background_review_callback = _bg_review_send
+            agent.background_review_callback = (
+                None if _codex_bridge is not None else _bg_review_send
+            )
             # Register the release hook on the adapter so base.py's finally
             # block can fire it after delivering the main response.
             if _status_adapter and session_key:
@@ -21543,7 +21578,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _mem_notif = user_config.get("display", {}).get("memory_notifications")
             if isinstance(_mem_notif, bool):
                 _mem_notif = "on" if _mem_notif else "off"
-            agent.memory_notifications = str(_mem_notif).lower() if _mem_notif else "on"
+            agent.memory_notifications = (
+                "off"
+                if _codex_bridge is not None
+                else (str(_mem_notif).lower() if _mem_notif else "on")
+            )
 
             # ------------------------------------------------------------------
             # Clarify callback: present a clarify prompt and block on a response.
@@ -21998,6 +22037,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                if _codex_bridge is not None:
+                    try:
+                        from gateway.codex_slack_bridge import persist_codex_thread
+
+                        persist_codex_thread(
+                            getattr(self._session_db, "_db", self._session_db),
+                            _codex_bridge,
+                            result.get("codex_thread_id"),
+                        )
+                    except Exception:
+                        logger.debug("Codex Slack bridge persistence failed", exc_info=True)
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
