@@ -677,8 +677,18 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        provider = str(getattr(agent, "provider", "") or "").strip().lower()
+        is_custom_provider = provider == "custom" or provider.startswith("custom:")
+        api_key = str(getattr(agent, "api_key", "") or "").strip()
+        app_server_env = (
+            {"OPENAI_API_KEY": api_key}
+            if is_custom_provider and api_key and api_key != "no-key-required"
+            else None
+        )
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            env=app_server_env,
+            oauth_auth_expected=not is_custom_provider,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,

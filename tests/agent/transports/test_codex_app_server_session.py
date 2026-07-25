@@ -152,6 +152,23 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_client_receives_environment_overrides(self):
+        client = FakeClient()
+        captured: dict = {}
+
+        def factory(**kwargs):
+            captured.update(kwargs)
+            return client
+
+        session = CodexAppServerSession(
+            cwd="/tmp",
+            env={"OPENAI_API_KEY": "litellm-virtual-key"},
+            client_factory=factory,
+        )
+        session.ensure_started()
+
+        assert captured["env"] == {"OPENAI_API_KEY": "litellm-virtual-key"}
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -882,6 +899,35 @@ class TestCompactThread:
         assert "compact unavailable" in r.error
         assert r.should_retire is False
 
+    def test_custom_provider_compaction_401_keeps_litellm_error(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+
+        def boom(method, params):
+            if method == "thread/compact/start":
+                raise CodexAppServerError(
+                    code=-32603,
+                    message=(
+                        "HTTP 401 Unauthorized: LiteLLM Virtual Key expected. "
+                        "Received=no-key-required"
+                    ),
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            return {}
+
+        client._request_handler = boom
+        result = make_session(
+            client,
+            oauth_auth_expected=False,
+        ).compact_thread(turn_timeout=2.0)
+
+        assert result.error is not None
+        assert "LiteLLM Virtual Key expected" in result.error
+        assert "codex login" not in result.error
+        assert result.should_retire is False
+
 
 # ---- approval bridge ----
 
@@ -1405,6 +1451,34 @@ class TestSessionRetirement:
         assert "codex login" in r.error
         assert r.should_retire is True
 
+    def test_custom_provider_401_keeps_litellm_error(self):
+        """A router key rejection is not evidence that Codex OAuth expired."""
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+
+        def boom(method, params):
+            if method == "turn/start":
+                raise CodexAppServerError(
+                    code=-32603,
+                    message=(
+                        "401: LiteLLM Virtual Key expected. Received=no-key-required"
+                    ),
+                )
+            return {
+                "thread": {"id": "t"},
+                "activePermissionProfile": {"id": "x"},
+            }
+
+        client._request_handler = boom
+        session = make_session(client, oauth_auth_expected=False)
+        result = session.run_turn("hi", turn_timeout=1.0)
+
+        assert result.error is not None
+        assert "LiteLLM Virtual Key expected" in result.error
+        assert "codex login" not in result.error
+        assert result.should_retire is False
+
     def test_oauth_failure_from_stderr_on_turn_start_failure(self):
         """If the RPC error itself is opaque but stderr shows an auth
         problem, we still classify it as a refresh failure."""
@@ -1586,13 +1660,27 @@ class TestClassifyOAuthFailure:
         from agent.transports.codex_app_server_session import (
             _classify_oauth_failure,
         )
+
         hint = _classify_oauth_failure("HTTP 401 Unauthorized")
         assert hint is not None
+
+    def test_custom_provider_401_not_classified_as_codex_oauth(self):
+        from agent.transports.codex_app_server_session import (
+            _classify_oauth_failure,
+        )
+
+        hint = _classify_oauth_failure(
+            "HTTP 401 Unauthorized: LiteLLM Virtual Key expected. "
+            "Received=no-key-required",
+            oauth_auth_expected=False,
+        )
+        assert hint is None
 
     def test_generic_error_not_classified(self):
         from agent.transports.codex_app_server_session import (
             _classify_oauth_failure,
         )
+
         assert _classify_oauth_failure("connection reset") is None
         assert _classify_oauth_failure("model returned bad json") is None
         assert _classify_oauth_failure("rate limit exceeded") is None
@@ -1601,6 +1689,7 @@ class TestClassifyOAuthFailure:
         from agent.transports.codex_app_server_session import (
             _classify_oauth_failure,
         )
+
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
@@ -1610,6 +1699,7 @@ class TestClassifyOAuthFailure:
         from agent.transports.codex_app_server_session import (
             _classify_oauth_failure,
         )
+
         hint = _classify_oauth_failure(
             "rpc returned -32603",
             "[stderr] token has expired, run codex login",

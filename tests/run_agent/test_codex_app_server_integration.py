@@ -50,14 +50,20 @@ def fake_session(monkeypatch):
     )
 
 
-def _make_codex_agent(**kwargs):
+def _make_codex_agent(
+    *,
+    provider: str = "openai",
+    api_key: str = "stub",
+    base_url: str = "https://stub.invalid",
+    **kwargs,
+):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
     return run_agent.AIAgent(
-        api_key="stub",
-        base_url="https://stub.invalid",
-        provider="openai",
+        api_key=api_key,
+        base_url=base_url,
+        provider=provider,
         api_mode="codex_app_server",
         quiet_mode=True,
         skip_context_files=True,
@@ -377,6 +383,35 @@ class TestRunConversationCodexPath:
             agent.run_conversation("hi")
 
         assert captured["cwd"] == str(tmp_path)
+
+    def test_custom_provider_key_is_passed_to_codex_app_server(self, monkeypatch):
+        """A LiteLLM custom route must not inherit an unrelated OpenAI key."""
+        captured: dict = {}
+
+        def fake_init(self, **kwargs):
+            captured.update(kwargs)
+            self._thread_id = "thread-stub-1"
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="ok",
+                projected_messages=[{"role": "assistant", "content": "ok"}],
+                turn_id="turn-stub-1",
+                thread_id="thread-stub-1",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent(
+            provider="custom",
+            api_key="litellm-virtual-key",
+        )
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("hi")
+
+        assert captured["env"] == {"OPENAI_API_KEY": "litellm-virtual-key"}
+        assert captured["oauth_auth_expected"] is False
 
     def _capture_routing_agent(self, monkeypatch):
         """Build a codex agent with a CodexAppServerSession stub that captures

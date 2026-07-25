@@ -228,15 +228,21 @@ _OAUTH_REFRESH_FAILURE_HINTS = (
 )
 
 
-def _classify_oauth_failure(*parts: str) -> Optional[str]:
+def _classify_oauth_failure(
+    *parts: str,
+    oauth_auth_expected: bool = True,
+) -> Optional[str]:
     """Return a user-friendly re-auth hint if any of the provided strings
     look like a codex OAuth/token-refresh failure; otherwise None.
 
     Used for both `turn/start` JSON-RPC errors and post-mortem stderr
     inspection when the subprocess exits unexpectedly. Conservative on
     purpose — we only redirect users to `codex login` when the signal
-    is strong, so unrelated runtime failures still surface verbatim.
+    is strong and the session expects Codex OAuth. Custom-provider 401s
+    are API-key/router failures and must surface without a login warning.
     """
+    if not oauth_auth_expected:
+        return None
     haystack = " ".join(p for p in parts if p).lower()
     if not haystack:
         return None
@@ -278,6 +284,8 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        env: Optional[dict[str, str]] = None,
+        oauth_auth_expected: bool = True,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -286,6 +294,8 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._env = dict(env) if env else None
+        self._oauth_auth_expected = oauth_auth_expected
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -320,7 +330,9 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                env=self._env,
             )
         self._client.initialize(
             client_name="hermes",
@@ -531,7 +543,11 @@ class CodexAppServerSession:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(exc.message, stderr_blob)
+            hint = _classify_oauth_failure(
+                exc.message,
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             if hint is not None:
                 result.error = hint
                 # Subprocess is fine on a JSON-RPC level here, but the
@@ -548,7 +564,10 @@ class CodexAppServerSession:
         except TimeoutError as exc:
             # turn/start hanging is a strong signal the subprocess is wedged.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(stderr_blob)
+            hint = _classify_oauth_failure(
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             result.error = hint or self._format_error_with_stderr(
                 "turn/start timed out", exc
             )
@@ -579,7 +598,10 @@ class CodexAppServerSession:
             # rather than waiting for the full turn deadline.
             if not self._client.is_alive():
                 stderr_blob = "\n".join(self._client.stderr_tail(60))
-                hint = _classify_oauth_failure(stderr_blob)
+                hint = _classify_oauth_failure(
+                    stderr_blob,
+                    oauth_auth_expected=self._oauth_auth_expected,
+                )
                 if hint is not None:
                     result.error = hint
                 else:
@@ -748,7 +770,11 @@ class CodexAppServerSession:
                         stderr_blob = "\n".join(
                             self._client.stderr_tail(40)
                         )
-                        hint = _classify_oauth_failure(err_msg, stderr_blob)
+                        hint = _classify_oauth_failure(
+                            err_msg,
+                            stderr_blob,
+                            oauth_auth_expected=self._oauth_auth_expected,
+                        )
                         if hint is not None:
                             result.error = hint
                             result.should_retire = True
@@ -824,7 +850,11 @@ class CodexAppServerSession:
             )
         except CodexAppServerError as exc:
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(exc.message, stderr_blob)
+            hint = _classify_oauth_failure(
+                exc.message,
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             if hint is not None:
                 result.error = hint
                 result.should_retire = True
@@ -835,7 +865,10 @@ class CodexAppServerSession:
             return result
         except TimeoutError as exc:
             stderr_blob = "\n".join(self._client.stderr_tail(40))
-            hint = _classify_oauth_failure(stderr_blob)
+            hint = _classify_oauth_failure(
+                stderr_blob,
+                oauth_auth_expected=self._oauth_auth_expected,
+            )
             result.error = hint or self._format_error_with_stderr(
                 "thread/compact/start timed out", exc
             )
@@ -853,7 +886,10 @@ class CodexAppServerSession:
 
             if not self._client.is_alive():
                 stderr_blob = "\n".join(self._client.stderr_tail(60))
-                hint = _classify_oauth_failure(stderr_blob)
+                hint = _classify_oauth_failure(
+                    stderr_blob,
+                    oauth_auth_expected=self._oauth_auth_expected,
+                )
                 if hint is not None:
                     result.error = hint
                 else:
@@ -957,7 +993,11 @@ class CodexAppServerSession:
                     err_obj = turn_obj.get("error")
                     err_msg = _format_responses_error(err_obj, str(turn_status))
                     stderr_blob = "\n".join(self._client.stderr_tail(40))
-                    hint = _classify_oauth_failure(err_msg, stderr_blob)
+                    hint = _classify_oauth_failure(
+                        err_msg,
+                        stderr_blob,
+                        oauth_auth_expected=self._oauth_auth_expected,
+                    )
                     if hint is not None:
                         result.error = hint
                         result.should_retire = True
