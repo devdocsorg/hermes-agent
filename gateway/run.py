@@ -13446,6 +13446,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_hard_msg_limit = 5000
             _hyg_timeout_seconds = 30.0
             _hyg_failure_cooldown_seconds = 300.0
+            _hyg_worker_timeout_safe = False
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -13511,6 +13512,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
                 _hyg_configured_base_url = _hyg_base_url
+
+                # ``run_in_executor`` cannot stop a running Python worker when
+                # ``asyncio.wait_for`` expires. If the outer hygiene timeout is
+                # shorter than the auxiliary compression call's own deadline,
+                # that worker can retain the per-session compression lock after
+                # the live turn begins. The live agent then cannot compact and
+                # loops on oversized requests (#long-thread-stall). Do not launch
+                # a racing helper at all; the live AIAgent owns its
+                # synchronous pre-API compression path and will retry safely.
+                _hyg_worker_timeout_safe = False
+                try:
+                    from agent.auxiliary_client import _effective_aux_timeout
+
+                    _hyg_aux_timeout_seconds = float(
+                        _effective_aux_timeout("compression", None)
+                    )
+                    _hyg_worker_timeout_safe = (
+                        _hyg_timeout_seconds >= _hyg_aux_timeout_seconds + 5.0
+                    )
+                except Exception as _hyg_timeout_err:
+                    logger.debug(
+                        "Could not resolve auxiliary compression timeout; "
+                        "deferring gateway hygiene compression to the live agent: %s",
+                        _hyg_timeout_err,
+                    )
 
                 try:
                     _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
@@ -13616,6 +13642,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
                 )
+
+                if _needs_compress and not _hyg_worker_timeout_safe:
+                    logger.info(
+                        "Session hygiene: deferring compression for %s to the live "
+                        "agent because hygiene timeout %.1fs does not outlive the "
+                        "auxiliary compression deadline",
+                        session_entry.session_id,
+                        _hyg_timeout_seconds,
+                    )
+                    _needs_compress = False
 
                 if _needs_compress:
                     _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)

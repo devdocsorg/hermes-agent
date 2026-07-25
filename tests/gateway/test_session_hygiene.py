@@ -54,6 +54,20 @@ def _make_large_history_tokens(target_tokens: int) -> list:
     return _make_history(n_msgs, content_size=content_size)
 
 
+def _allow_bounded_hygiene_worker(monkeypatch) -> None:
+    """Make the synthetic compressor's inner deadline fit the gateway budget.
+
+    Production defaults deliberately fail this safety check (the auxiliary
+    compression request can run far longer than gateway hygiene is willing to
+    wait). Tests that exercise successful helper compression opt into a bounded
+    inner call; the timeout-race regression test intentionally does not.
+    """
+    monkeypatch.setattr(
+        "agent.auxiliary_client._effective_aux_timeout",
+        lambda _task, _timeout: 1.0,
+    )
+
+
 class HygieneCaptureAdapter(BasePlatformAdapter):
     def __init__(self):
         super().__init__(PlatformConfig(enabled=True, token="fake-token"), Platform.TELEGRAM)
@@ -306,6 +320,7 @@ async def test_session_hygiene_messages_stay_in_originating_topic(monkeypatch, t
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    _allow_bounded_hygiene_worker(monkeypatch)
 
     class FakeCompressAgent:
         last_instance = None
@@ -686,12 +701,15 @@ async def test_session_hygiene_skips_compression_during_failure_cooldown(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monkeypatch, tmp_path):
-    """A timed-out SessionDB-bound worker cannot compact after the live turn starts.
+async def test_session_hygiene_timeout_does_not_launch_a_racing_compressor(monkeypatch, tmp_path):
+    """Hygiene must never leave a compressor racing the live user turn.
 
-    The worker remains alive long enough to cross the old race window. The
-    timeout must fence its eventual commit, continue to the live agent, and
-    clean up the temporary agent only after the worker actually returns.
+    A configured hygiene timeout shorter than the auxiliary compression timeout
+    cannot safely bound a thread-pool worker: cancelling the asyncio Future does
+    not stop that thread, so it can retain the compression lock for minutes. In
+    that configuration hygiene defers compression to the live agent's own
+    synchronous preflight instead, avoiding a long-lived lock that would make
+    the live turn loop on an oversized context.
     """
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
@@ -811,27 +829,15 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
     elapsed = time.monotonic() - started
 
     assert result == "ok"
-    # Loose wall-clock bound per flake policy: this asserts the handler did
-    # NOT block on the hygiene-compression timeout path (which would take
-    # multiple seconds), not a precise latency. 0.15s missed by ~1-8ms on
-    # busy CI shards twice on 2026-07-23.
     assert elapsed < 2.0
-    assert worker_started.is_set()
+    assert not worker_started.is_set()
     assert runner._run_agent.await_count == 1
-    assert runner._hygiene_compression_failure_cooldowns["sess-timeout"] > time.time()
+    assert not hasattr(runner, "_hygiene_compression_failure_cooldowns")
     timeout_warnings = [s for s in adapter.sent if "Context compression timed out" in s["content"]]
-    assert len(timeout_warnings) == 1
+    assert timeout_warnings == []
     fake_db.archive_and_compact.assert_not_called()
-    SlowCompressAgent.last_instance.close.assert_not_called()
-
-    release_worker.set()
-    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
-
-    # The late worker observed cancellation at the commit fence, so it never
-    # mutated the live session after the new turn began. Cleanup still ran once
-    # it was safe to tear down the helper agent's clients/providers.
-    fake_db.archive_and_compact.assert_not_called()
-    SlowCompressAgent.last_instance.close.assert_called_once()
+    assert SlowCompressAgent.last_instance is None
+    assert not cleanup_done.is_set()
 
 
 @pytest.mark.asyncio
@@ -844,6 +850,7 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    _allow_bounded_hygiene_worker(monkeypatch)
 
     class FakeCompressAgentWithSummaryFailure:
         last_instance = None
@@ -963,6 +970,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    _allow_bounded_hygiene_worker(monkeypatch)
 
     class FakeCompressAgentWithAuxRecovery:
         last_instance = None
@@ -1093,6 +1101,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    _allow_bounded_hygiene_worker(monkeypatch)
 
     fake_db = object()
 
@@ -1212,6 +1221,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    _allow_bounded_hygiene_worker(monkeypatch)
 
     class FakeCompressAgent:
         last_instance = None
