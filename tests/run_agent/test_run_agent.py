@@ -5998,6 +5998,46 @@ class TestRunConversation:
         assert call.kwargs.get("end_run") is True
         assert "Iteration budget exhausted" in call.kwargs.get("error", "")
 
+    def test_goal_mode_keeps_claim_on_iteration_exhaustion(self, agent, monkeypatch):
+        """Goal-mode owns continuation after a turn budget is exhausted.
+
+        Releasing the claim here races the still-live worker against a fresh
+        dispatcher spawn and prevents ``_run_kanban_goal_loop_q`` from starting
+        its next judged turn (issue #71175). Ordinary Kanban tasks keep the
+        failure/circuit-breaker behavior covered by the test above.
+        """
+        self._setup_agent(agent)
+        agent.max_iterations = 2
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_goal_task_123")
+        monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        tool_resp = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc],
+        )
+        summary_resp = _mock_response(
+            content="Checkpoint summary for the goal loop.", finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_resp, tool_resp, summary_resp,
+        ]
+
+        mock_record_failure = MagicMock(return_value=False)
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("hermes_cli.kanban_db._record_task_failure", mock_record_failure),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue the durable goal")
+
+        assert result["completed"] is False
+        assert result["turn_exit_reason"] == "max_iterations_reached(2/2)"
+        assert result["final_response"] == "Checkpoint summary for the goal loop."
+        mock_record_failure.assert_not_called()
+
     def test_no_kanban_block_when_not_in_kanban_mode(self, agent, monkeypatch):
         """The exhaustion bridge must NOT fire when HERMES_KANBAN_TASK
         is unset (non-kanban runs are unaffected by #29747 gap 2)."""

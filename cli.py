@@ -16079,6 +16079,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         return
 
     max_turns = task.goal_max_turns or _DEF_TURNS
+    expected_run_id = (_os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(
@@ -16100,7 +16101,20 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
         c = _kb.connect()
         try:
             t = _kb.get_task(c, task_id)
-            return t.status if t is not None else None
+            if t is None:
+                return None
+            if expected_run_id:
+                current_run_id = getattr(t, "current_run_id", None)
+                if current_run_id is None or str(current_run_id) != expected_run_id:
+                    logger.warning(
+                        "Kanban goal worker %s lost run ownership "
+                        "(expected run=%s, current run=%s); stopping goal loop",
+                        task_id,
+                        expected_run_id,
+                        current_run_id,
+                    )
+                    return "run_reclaimed"
+            return t.status
         finally:
             try:
                 c.close()

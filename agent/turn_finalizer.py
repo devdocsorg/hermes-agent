@@ -142,17 +142,39 @@ def finalize_turn(
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
-        # If running as a kanban worker, signal the dispatcher that the
-        # worker could not complete (rather than treating it as a
-        # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
+        # If running as an ordinary kanban worker, signal the dispatcher that
+        # the worker could not complete (rather than treating it as a protocol
+        # violation). This applies whether the user-facing fallback came from
+        # the summary call or an explicitly pending continuation; both exhausted
+        # the task budget and must advance the failure circuit.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # Goal-mode is deliberately different: the outer Ralph loop owns
+        # continuation across multiple bounded run_conversation turns. Its claim
+        # must remain live here so the next judged turn can start safely.
+        #
+        # Ordinary workers route through
+        # ``_record_task_failure(outcome="timed_out")`` rather than
+        # ``kanban_block`` so this counts toward the dispatcher's consecutive-
+        # failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
-        if _kanban_task:
+        _kanban_goal_mode = os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
+        if _kanban_task and _kanban_goal_mode:
+            # Goal-mode has a higher-level Ralph loop in cli.py. A single
+            # run_conversation budget is one bounded *turn* of that loop, not a
+            # failed task attempt. Releasing the claim here lets the dispatcher
+            # spawn a second writer while this worker is still alive and causes
+            # the ownership fence to stop the intended continuation (#71175).
+            # Keep the claim/run intact; _run_kanban_goal_loop_q will judge the
+            # summary and start another fresh-budget turn, or block/complete via
+            # the normal Kanban tools and goal-turn cap.
+            logger.info(
+                "goal-mode task %s exhausted one turn budget (%d/%d); "
+                "preserving claim for the goal continuation loop",
+                _kanban_task,
+                api_call_count,
+                agent.max_iterations,
+            )
+        elif _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()

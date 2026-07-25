@@ -3264,8 +3264,14 @@ def test_connect_falls_back_to_delete_on_locking_protocol(tmp_path, monkeypatch,
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-    # Clear module cache so a fresh connect() is attempted
+    # Clear module cache so a fresh connect() is attempted. Warning dedup is
+    # process-global and earlier tests may already have emitted the vulnerable-
+    # SQLite `kanban.db` notice; isolate both warning registries so this test's
+    # caplog assertion does not depend on test order.
     kb._INITIALIZED_PATHS.clear()
+    import hermes_state as _hermes_state
+    monkeypatch.setattr(_hermes_state, "_wal_fallback_warned_paths", set())
+    monkeypatch.setattr(_hermes_state, "_wal_reset_bug_warned_paths", set())
 
     real_connect = _sqlite3.connect
 

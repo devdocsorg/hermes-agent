@@ -166,11 +166,20 @@ VALID_HOOKS: Set[str] = {
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:
-    #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
+    #   {"action": "skip",    "reason": ...}  -> drop message (no reply)
     #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
-    #   {"action": "allow"}  /  None             -> normal dispatch
+    #   {"action": "allow"}  /  None          -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Gateway post-auth dispatch hook. Fired only after a user-originated
+    # event has passed the normal pairing / allowlist boundary and before an
+    # agent session is created. This is the safe place for plugins that need
+    # to persist or route authorized work without spending an LLM/tool turn.
+    # Return values mirror pre_gateway_dispatch, plus:
+    #   {"action": "respond", "text": "..."} -> return a user-visible reply
+    #                                         and skip agent dispatch.
+    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
+    "post_gateway_auth",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.

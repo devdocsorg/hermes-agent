@@ -298,6 +298,51 @@ def test_loop_stops_if_task_reclaimed(monkeypatch):
     assert res["outcome"] == "stopped"
 
 
+def test_cli_goal_loop_stops_when_worker_loses_run_ownership(monkeypatch):
+    """A live worker must not continue after its task run was released/reclaimed."""
+    from types import SimpleNamespace
+    from typing import Any, cast
+
+    import cli as cli_mod
+
+    task = SimpleNamespace(
+        id="t_owned",
+        title="long goal",
+        body="finish it",
+        goal_max_turns=20,
+        status="running",
+        current_run_id=42,
+    )
+
+    class _Conn:
+        def close(self):
+            pass
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task.id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "41")
+    monkeypatch.setattr(kb, "connect", lambda: _Conn())
+    monkeypatch.setattr(kb, "get_task", lambda _conn, _task_id: task)
+
+    captured = {}
+
+    def _capture_loop(**kwargs):
+        captured["status"] = kwargs["task_status_fn"]()
+        return {"outcome": "stopped"}
+
+    monkeypatch.setattr(goals, "run_kanban_goal_loop", _capture_loop)
+    fake_cli = SimpleNamespace(
+        agent=SimpleNamespace(run_conversation=lambda **_kwargs: pytest.fail("should not run")),
+        conversation_history=[],
+        session_id="session",
+    )
+
+    cli_mod._run_kanban_goal_loop_q(
+        cast(Any, fake_cli), "first turn exhausted its budget"
+    )
+
+    assert captured["status"] not in {"running", "ready"}
+
+
 # ---------------------------------------------------------------------------
 # CLI judge gate tests (hermes kanban complete bypass fix)
 # ---------------------------------------------------------------------------
