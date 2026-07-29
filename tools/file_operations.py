@@ -27,6 +27,7 @@ Usage:
 
 import os
 import re
+import sys
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -51,6 +52,15 @@ _HOME = str(Path.home())
 WRITE_DENIED_PATHS = build_write_denied_paths(_HOME)
 
 WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
+
+# Recursive searches from a broad root such as ``~`` must not enter these
+# macOS TCC-protected app-data trees. Merely traversing them can trigger one
+# privacy prompt per Python process, which is especially disruptive when
+# several agent transports are active concurrently.
+_MACOS_TCC_SEARCH_ROOTS = (
+    os.path.normpath(os.path.join(_HOME, "Library", "Containers")),
+    os.path.normpath(os.path.join(_HOME, "Library", "Group Containers")),
+)
 
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -147,6 +157,64 @@ def _has_bom(text: Optional[str]) -> bool:
 def _is_write_denied(path: str) -> bool:
     """Return True if path is on the write deny list."""
     return _shared_is_write_denied(path)
+
+
+def _normalized_lexical_path(path: str) -> str:
+    """Normalize a local path without resolving symlinks or touching disk."""
+    return os.path.normpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def _is_same_or_descendant(path: str, parent: str) -> bool:
+    """Return whether ``path`` is lexically equal to or below ``parent``."""
+    try:
+        normalized_path = _normalized_lexical_path(path)
+        normalized_parent = _normalized_lexical_path(parent)
+        common = os.path.commonpath([normalized_path, normalized_parent])
+        if sys.platform == "darwin":
+            return common.casefold() == normalized_parent.casefold()
+        return common == normalized_parent
+    except (OSError, ValueError):
+        return False
+
+
+def _macos_tcc_search_error(path: str) -> Optional[str]:
+    """Reject search scopes that contain or enter macOS app-container data."""
+    if sys.platform != "darwin":
+        return None
+    for protected_root in _MACOS_TCC_SEARCH_ROOTS:
+        if _is_same_or_descendant(path, protected_root):
+            return (
+                "Search blocked: macOS protects app-container data under "
+                f"{protected_root}. Search a specific project or non-protected "
+                "directory instead."
+            )
+        if _is_same_or_descendant(protected_root, path):
+            return (
+                "Search blocked: this scope is broad enough to traverse macOS "
+                f"protected app data under {protected_root}. Search a specific "
+                "project or non-protected directory instead."
+            )
+    return None
+
+
+def _macos_tcc_descendants(path: str) -> List[tuple[str, str]]:
+    """Return protected descendants as ``(absolute, relative)`` path pairs."""
+    if sys.platform != "darwin":
+        return []
+
+    normalized_root = _normalized_lexical_path(path)
+    descendants: List[tuple[str, str]] = []
+    for protected_root in _MACOS_TCC_SEARCH_ROOTS:
+        try:
+            normalized_protected = _normalized_lexical_path(protected_root)
+            if os.path.commonpath([normalized_root, normalized_protected]) != normalized_root:
+                continue
+            relative = os.path.relpath(normalized_protected, normalized_root)
+        except (OSError, ValueError):
+            continue
+        if relative != "." and not relative.startswith(f"..{os.sep}"):
+            descendants.append((normalized_protected, relative.replace(os.sep, "/")))
+    return descendants
 
 
 # =============================================================================
@@ -2073,6 +2141,16 @@ class ShellFileOperations(FileOperations):
 
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+
+        tcc_scope_path = path
+        if not os.path.isabs(tcc_scope_path):
+            effective_cwd = getattr(self.env, "cwd", None) or self.cwd
+            if effective_cwd and os.path.isabs(effective_cwd):
+                tcc_scope_path = os.path.join(effective_cwd, tcc_scope_path)
+
+        tcc_error = _macos_tcc_search_error(tcc_scope_path)
+        if tcc_error:
+            return SearchResult(error=tcc_error, total_count=0)
         
         # Validate that the path exists before searching
         check = self._exec(f"test -e {self._escape_shell_arg(path)} && echo exists || echo not_found")
@@ -2122,6 +2200,7 @@ class ShellFileOperations(FileOperations):
             search_pattern = pattern.split('/')[-1]
 
         search_root = Path(path)
+        tcc_descendants = _macos_tcc_descendants(path)
         has_hidden_path_ancestor = any(
             part not in {".", ".."} and part.startswith(".")
             for part in search_root.parts
@@ -2144,6 +2223,13 @@ class ShellFileOperations(FileOperations):
         # Exclude hidden directories (matching ripgrep's default behavior).
         hidden_exclude = "-not -path '*/.*'" if not has_hidden_path_ancestor else ""
         hidden_filter_expr = f" {hidden_exclude}" if hidden_exclude else ""
+        tcc_prune_expr = ""
+        if tcc_descendants:
+            protected_terms = " -o ".join(
+                f"-path {self._escape_shell_arg(absolute)}"
+                for absolute, _relative in tcc_descendants
+            )
+            tcc_prune_expr = f" \\( {protected_terms} \\) -prune -o"
 
         # Use shell pagination for standard roots. For hidden roots, gather full
         # output so we can re-apply hidden-descendant filtering while allowing
@@ -2152,7 +2238,7 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        cmd = f"find {self._escape_shell_arg(path)}{tcc_prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2160,7 +2246,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)}{tcc_prune_expr}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2215,9 +2301,16 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
+        exclude_args = " ".join(
+            f"-g {self._escape_shell_arg(f'!{relative}/**')}"
+            for _absolute, relative in _macos_tcc_descendants(path)
+        )
+        if exclude_args:
+            exclude_args += " "
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
+            f"rg --files --sortr=modified {exclude_args}"
+            f"-g {self._escape_shell_arg(glob_pattern)} "
             f"{self._escape_shell_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
@@ -2228,7 +2321,8 @@ class ShellFileOperations(FileOperations):
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"rg --files {exclude_args}"
+                f"-g {self._escape_shell_arg(glob_pattern)} "
                 f"{self._escape_shell_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
@@ -2276,6 +2370,9 @@ class ShellFileOperations(FileOperations):
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+
+        for _absolute, relative in _macos_tcc_descendants(path):
+            cmd_parts.extend(["--glob", self._escape_shell_arg(f"!{relative}/**")])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -2398,6 +2495,16 @@ class ShellFileOperations(FileOperations):
         # Exclude hidden directories (matching ripgrep's default behavior).
         # This prevents searching inside .hub/index-cache/, .git/, etc.
         cmd_parts.append("--exclude-dir='.*'")
+
+        # BSD/GNU grep only support basename directory exclusions. Apply these
+        # only when the search root actually contains the protected macOS
+        # directories, so ordinary project searches are unaffected.
+        excluded_basenames = {
+            os.path.basename(absolute)
+            for absolute, _relative in _macos_tcc_descendants(path)
+        }
+        for basename in sorted(excluded_basenames):
+            cmd_parts.append(f"--exclude-dir={self._escape_shell_arg(basename)}")
         
         # Add context if requested
         if context > 0:

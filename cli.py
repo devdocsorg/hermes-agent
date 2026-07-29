@@ -1336,6 +1336,26 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
         _single_query_finalize_attempted_session_ids.add(session_id)
 
 
+def _single_query_exit_code(result: Any) -> int:
+    """Map a completed one-shot agent result to the CLI process exit code."""
+    if not isinstance(result, dict) or not result.get("failed"):
+        return 0
+
+    if os.environ.get("HERMES_KANBAN_TASK") and result.get(
+        "failure_reason"
+    ) in ("rate_limit", "billing"):
+        try:
+            from hermes_cli.kanban_db import (
+                KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
+            )
+
+            return _RL_CODE
+        except Exception:
+            pass
+
+    return 1
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
@@ -4529,6 +4549,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # don't auto-queue another continuation on top of a user-cancelled
         # turn (which would make Ctrl+C feel like it did nothing).
         self._last_turn_interrupted = False
+        self._last_turn_exit_code = 0
         self._should_exit = False
         # /exit --delete: when True, the current session's SQLite history and
         # on-disk transcripts are deleted during shutdown. Set by
@@ -13147,6 +13168,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # this to True. Early returns (credential refresh failure, etc.)
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
+        # Default to failure until the agent returns a structured successful
+        # result. This keeps credential/init failures and unexpected early
+        # returns from being reported as successful one-shot invocations.
+        self._last_turn_exit_code = 1
 
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
@@ -13621,6 +13646,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            self._last_turn_exit_code = _single_query_exit_code(result)
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -17616,19 +17642,7 @@ def main(
                         # 5-hour quota window can't trip the circuit breaker and
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
-                        _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
-                            _exit_code = 1
-                            if os.environ.get("HERMES_KANBAN_TASK") and result.get(
-                                "failure_reason"
-                            ) in ("rate_limit", "billing"):
-                                try:
-                                    from hermes_cli.kanban_db import (
-                                        KANBAN_RATE_LIMIT_EXIT_CODE as _RL_CODE,
-                                    )
-                                    _exit_code = _RL_CODE
-                                except Exception:
-                                    _exit_code = 1
+                        _exit_code = _single_query_exit_code(result)
                         sys.exit(_exit_code)
 
                 # Exit with error code if credentials or agent init fails
@@ -17655,6 +17669,9 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary(clear_screen=False)
+                _exit_code = getattr(cli, "_last_turn_exit_code", 0)
+                if _exit_code:
+                    sys.exit(_exit_code)
         finally:
             _finalize_single_query(cli)
         return

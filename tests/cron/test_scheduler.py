@@ -534,8 +534,15 @@ class TestResolveDeliveryTarget:
 class TestRoutingIntents:
     """``all`` routing intent expands at fire time."""
 
+    @pytest.fixture(autouse=True)
+    def _builtin_home_platforms_only(self, monkeypatch):
+        """Keep built-in routing tests independent from plugin SDK imports."""
+        import cron.scheduler as scheduler
+        builtin_platforms = tuple(scheduler._HOME_TARGET_ENV_VARS)
+        monkeypatch.setattr(scheduler, "_iter_home_target_platforms", lambda: iter(builtin_platforms))
+
     def test_all_expands_to_every_connected_home_channel(self, monkeypatch):
-        """deliver='all' fans out to every platform with a configured home channel."""
+        """Fan out to each configured built-in home channel."""
         from cron.scheduler import _resolve_delivery_targets
 
         monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-111")
