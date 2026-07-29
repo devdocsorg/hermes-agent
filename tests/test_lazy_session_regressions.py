@@ -347,6 +347,43 @@ class TestGatewaySurfacesNullResponse:
         assert response != "", "Null response with api_calls>0 must be surfaced"
         assert "nonexistent_tool" in response
 
+    def test_truncated_response_is_labelled_not_shipped_as_final(self):
+        """A deadline-truncated turn HAS text, and it must not read as final.
+
+        Production 2026-07-28: a codex turn hit the 600s wall mid-work and the
+        gateway posted its last internal narration to Slack as the reply.
+        """
+        from gateway.run import _normalize_empty_agent_response
+
+        note = (
+            "I'm using the authenticated Slack web session to locate the "
+            "unique parent message, then I'll return to the API"
+        )
+        response = _normalize_empty_agent_response(
+            {
+                "final_response": note, "api_calls": 7, "partial": True,
+                "truncated": True, "interrupted": False,
+                "error": "turn truncated: codex was still working",
+            },
+            note, history_len=40,
+        )
+        assert note in response
+        assert "cut off" in response.lower()
+        assert response != note
+
+    def test_untruncated_response_passes_through_unchanged(self):
+        """The label attaches ONLY to truncated turns."""
+        from gateway.run import _normalize_empty_agent_response
+
+        answer = "Here are your three standup items: ..."
+        assert _normalize_empty_agent_response(
+            {
+                "final_response": answer, "api_calls": 3, "partial": False,
+                "truncated": False, "interrupted": False,
+            },
+            answer, history_len=40,
+        ) == answer
+
     def test_interrupted_response_stays_empty(self):
         """Interrupted agent → response stays empty (platform handles UX)."""
         from gateway.run import _normalize_empty_agent_response

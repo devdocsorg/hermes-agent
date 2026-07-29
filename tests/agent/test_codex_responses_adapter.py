@@ -603,3 +603,83 @@ def test_normalize_codex_response_xai_reasoning_without_marker_stays_incomplete(
 
     assert finish_reason == "incomplete"
     assert assistant_message.content == ""
+
+
+# ---------------------------------------------------------------------------
+# Tool NAME character class (2026-07-28/29 production incident).
+# Upstream fixed the call_id LENGTH (#73492) but not the name PATTERN, so this
+# class kept failing after that fix landed — verbatim at 2026-07-29 05:09:04Z:
+#   "Invalid 'input[1].name': string does not match pattern '^[a-zA-Z0-9_-]+$'"
+# Real dotted names measured in ~/.hermes/sessions.
+# ---------------------------------------------------------------------------
+
+_REAL_DOTTED_NAMES = [
+    "mcp.devdocs.notion_search",
+    "mcp.hermes-tools.skill_view",
+    "mcp.node_repl.js",
+]
+
+
+@pytest.mark.parametrize("dotted", _REAL_DOTTED_NAMES)
+def test_preflight_sanitizes_dotted_tool_name(dotted):
+    import re as _re
+    items = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": "call_x", "name": dotted, "arguments": "{}"}]
+    )
+    assert _re.fullmatch(r"[a-zA-Z0-9_-]+", items[0]["name"]), items[0]["name"]
+
+
+@pytest.mark.parametrize("dotted", _REAL_DOTTED_NAMES)
+def test_chat_converter_sanitizes_dotted_tool_name(dotted):
+    """The converter is a SECOND entry point that skips the preflight."""
+    import re as _re
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_x",
+                        "call_id": "call_x",
+                        "type": "function",
+                        "function": {"name": dotted, "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+    )
+    calls = [i for i in items if i.get("type") == "function_call"]
+    assert calls
+    assert _re.fullmatch(r"[a-zA-Z0-9_-]+", calls[0]["name"]), calls[0]["name"]
+
+
+def test_tool_definition_and_call_sanitize_identically():
+    """Definition and replayed call MUST agree, or the model cannot match its
+    own tool call to a declared tool — a worse failure than the 400."""
+    dotted = "mcp.devdocs.slack_v2_list_conversation_history"
+    from_history = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": "c", "name": dotted, "arguments": "{}"}]
+    )[0]["name"]
+    kwargs = _preflight_codex_api_kwargs(
+        {
+            "model": "codex-auto",
+            "instructions": "be helpful",
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function", "name": dotted, "description": "d",
+                "parameters": {"type": "object", "properties": {}},
+            }],
+            "store": False,
+        }
+    )
+    assert from_history == kwargs["tools"][0]["name"]
+    assert from_history == "mcp_devdocs_slack_v2_list_conversation_history"
+
+
+def test_legal_tool_name_passes_through_unchanged():
+    legal = "slack_v2_list_conversation_history"
+    items = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": "c", "name": legal, "arguments": "{}"}]
+    )
+    assert items[0]["name"] == legal
