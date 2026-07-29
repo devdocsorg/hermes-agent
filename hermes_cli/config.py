@@ -983,6 +983,15 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Wall-clock floor (seconds) for waiting out a transport-class provider
+        # outage — connection refused/reset, read timeout, 5xx.  api_max_retries
+        # above is a COUNT, and a count spans only seconds: when the local
+        # router went down on 2026-07-26 every session spent its whole budget in
+        # ~23s and killed turns that had been running for hours.  While a
+        # transport failure is younger than this floor the agent keeps retrying
+        # (with the normal jittered backoff) instead of surfacing a dead turn.
+        # Set to 0 to disable and restore pure count-based behavior.
+        "api_transport_retry_floor_seconds": 300,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
@@ -1094,6 +1103,19 @@ DEFAULT_CONFIG = {
         # (60+ tool iterations with tiny output) before users assume the
         # bot is dead and /restart.
         "gateway_notify_interval": 180,
+        # How long a long-running heartbeat may be edited in place before it is
+        # re-posted as a NEW message. Editing generates no notification and
+        # keeps the original timestamp, so an edit-only heartbeat makes a
+        # healthy long run look frozen (observed 2026-07-27: a bubble posted at
+        # 19:40 was still being edited at 20:06 and was reported as dead).
+        # 0 disables re-posting and restores pure edit-in-place.
+        "gateway_notify_repost_interval": 600,
+        # After a gateway restart interrupts a turn, should the resumed turn
+        # CONTINUE the interrupted task, or report "session restored" and ask
+        # the user what to do next?  Continuing is the default: a long
+        # autonomous workstream otherwise dies at every restart until a human
+        # types "keep going".  Set false to restore ask-first behavior.
+        "resume_continues_work": True,
         # Freshness window for the gateway auto-continue note (seconds).
         # After a gateway crash/restart/SIGTERM mid-run, the next user
         # message gets a "[System note: your previous turn was

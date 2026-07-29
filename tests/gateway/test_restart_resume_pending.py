@@ -483,10 +483,32 @@ class TestResumePendingSystemNote:
         )
         assert "gateway shutdown" in result
 
-    def test_empty_message_interactive_note_asks_what_next(self):
-        """Interactive platforms: the startup auto-resume turn reports the
-        restore and asks the (present) human what to do next."""
+    def test_empty_message_interactive_note_continues_by_default(self):
+        """Interactive platforms now CONTINUE the interrupted task by default.
+
+        "A human is present" is not "a human is waiting to re-authorise the
+        work". Observed 2026-07-27: a gateway restart at 20:30:56 turned a
+        multi-hour autonomous workstream into "The session was restored
+        successfully. What would you like to do next?" at 20:31:53, and the
+        thread stayed dead until the operator typed "keep going" — which they
+        had already had to do several times that day. #57056 fixed exactly
+        this for non-interactive platforms; the same reasoning applies here.
+        """
         note = build_resume_recovery_note("restart_timeout", "", interactive=True)
+        assert "CONTINUE the interrupted task" in note
+        assert "ask what they would like to do next" not in note
+        # Still tells the operator what it picked up — continuing must not mean
+        # continuing silently.
+        assert "ONE short line" in note
+        # And must not tell the model to discard the work it is resuming.
+        assert "skip any unfinished work" not in note
+        assert "already appear in the history" in note
+
+    def test_empty_message_interactive_note_asks_what_next_when_opted_out(self):
+        """agent.resume_continues_work: false restores the ask-first note."""
+        note = build_resume_recovery_note(
+            "restart_timeout", "", interactive=True, continue_work=False
+        )
         assert "session was restored" in note
         assert "ask what they would like to do next" in note
         assert "skip any unfinished work" in note
@@ -728,6 +750,9 @@ class TestResumePendingSystemNote:
             "start a new task",
             resume_entry=None,
             agent_history=agent_history,
+            # Keep this regression independent of the operator's live
+            # agent.gateway_auto_continue_freshness override.
+            window_secs=3600,
         )
         assert result == "start a new task"
 
@@ -791,10 +816,11 @@ class TestResumePendingSystemNote:
         assert "already" in result and "do NOT re-execute or verify" in result
         assert "restarted!" in result
 
-    def test_resume_pending_empty_message_reports_recovery(self):
+    def test_resume_pending_empty_message_resumes_the_work(self):
         """On the empty-message auto-resume startup turn there is no NEW user
-        message, so the note instructs the model to report recovery and ask
-        for instructions rather than 'address the user's NEW message'.
+        message, so the note tells the model to pick the interrupted task back
+        up rather than 'address the user's NEW message' — and, since 2026-07-27,
+        rather than stopping to ask for instructions it already has.
         """
         entry = self._pending_entry(reason="restart_timeout")
         result = _simulate_note_injection(
@@ -806,8 +832,8 @@ class TestResumePendingSystemNote:
         )
         assert "[System note:" in result
         assert "gateway restart" in result
-        assert "restored successfully" in result
-        assert "ask what they would like to do next" in result
+        assert "CONTINUE the interrupted task" in result
+        assert "ask what they would like to do next" not in result
         assert "do NOT re-execute or verify" in result
         # No phantom "NEW message" instruction when there is no new message.
         assert "NEW message" not in result

@@ -679,6 +679,7 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            thread_name=getattr(agent, "codex_thread_name", None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -842,9 +843,13 @@ def run_codex_app_server_turn(
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
+    # A truncated turn is excluded for the same reason the memory sync above
+    # excludes errored turns: distilling lessons from a transcript that was
+    # cut off mid-work teaches the skill library things that never happened.
     if (
         turn.final_text
         and not turn.interrupted
+        and not getattr(turn, "truncated", False)
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -869,6 +874,10 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        # True when the turn deadline fired mid-work and final_response is the
+        # last thing codex said rather than an answer. Distinct from a plain
+        # error: there IS deliverable text, it is just not a completed reply.
+        "truncated": bool(getattr(turn, "truncated", False)),
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

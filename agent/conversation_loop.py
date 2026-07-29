@@ -77,9 +77,11 @@ from agent.prompt_caching import (
     strip_anthropic_cache_control,
 )
 from agent.retry_utils import (
+    TRANSPORT_RETRY_FLOOR_SECONDS,
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
+    should_extend_transport_retry,
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
@@ -5030,6 +5032,66 @@ def run_conversation(
                         "failed": True,
                         "error": _nonretryable_summary,
                     }
+
+                if retry_count >= max_retries:
+                    _retry.budget_exhaustions += 1
+
+                # ── A retry budget is a DURATION, not a count ──────────
+                # The attempt counter is exhausted, but for a transport
+                # outage that proves nothing: on 2026-07-26 seven live
+                # sessions burned 3 attempts + a transport rebuild + 3
+                # more inside ~23 SECONDS when the local router stopped
+                # serving, and one 28-hour workstream died with them.
+                # Grant more attempts until we have actually been patient
+                # on the clock. Falls through to the normal jittered
+                # backoff below (which honours interrupts), so this widens
+                # the window without ever busy-looping.
+                #
+                # Ordering is load-bearing, and getting it wrong was caught
+                # by test_32646_fallback_429_after_timeout going red: the
+                # existing recovery ladder — rebuild the primary transport,
+                # then walk the fallback chain — must run FIRST, because a
+                # healthy fallback provider beats any amount of patience.
+                # So the clock only takes over from the second exhaustion
+                # onward, and only when there is nowhere left to switch to.
+                if (
+                    retry_count >= max_retries
+                    and _retry.budget_exhaustions > 1
+                    and not agent._has_pending_fallback()
+                    and should_extend_transport_retry(
+                        reason=classified.reason,
+                        elapsed_s=time.time() - api_start_time,
+                        floor_s=getattr(
+                            agent,
+                            "_api_transport_retry_floor_s",
+                            TRANSPORT_RETRY_FLOOR_SECONDS,
+                        ),
+                        extensions_used=_retry.transport_retry_extensions,
+                    )
+                ):
+                    _retry.transport_retry_extensions += 1
+                    max_retries += 1
+                    _elapsed_s = time.time() - api_start_time
+                    logger.warning(
+                        "%sTransport failure not yet waited out — extending retry "
+                        "budget on the clock (%.0fs elapsed of %.0fs floor, "
+                        "extension %s): %s | provider=%s model=%s",
+                        agent.log_prefix,
+                        _elapsed_s,
+                        getattr(
+                            agent,
+                            "_api_transport_retry_floor_s",
+                            TRANSPORT_RETRY_FLOOR_SECONDS,
+                        ),
+                        _retry.transport_retry_extensions,
+                        agent._summarize_api_error(api_error),
+                        _provider,
+                        _model,
+                    )
+                    agent._buffer_status(
+                        f"⏳ Provider unreachable for {int(_elapsed_s)}s — "
+                        f"still retrying rather than dropping this turn"
+                    )
 
                 if retry_count >= max_retries:
                     # Before falling back, try rebuilding the primary

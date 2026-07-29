@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -254,19 +256,243 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
-    )
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        events.append(("run_job_enter", job["id"]))
+        assert not any(event[0] == "running" for event in events)
+        scheduler._notify_cron_execution_started()
+        events.append(("work_started", job["id"]))
+        return True, "output", "response", None
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
     assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
-    assert events[0] == ("running", "exec-3")
+    assert events[:3] == [
+        ("run_job_enter", "job-3"),
+        ("running", "exec-3"),
+        ("work_started", "job-3"),
+    ]
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+
+
+@pytest.mark.parametrize(
+    ("case", "script_ok", "script_output", "expected_status"),
+    [
+        ("output", True, "watchdog complete", "completed"),
+        ("wake-agent-false", True, '{"wakeAgent": false}', "completed"),
+        ("empty-output", True, "", "completed"),
+        ("script-failure", False, "probe failed", "failed"),
+    ],
+)
+def test_run_one_job_no_agent_marks_running_at_script_boundary_and_terminal(
+    monkeypatch, tmp_path, case, script_ok, script_output, expected_status
+):
+    """Script-only jobs become running before work and retain that start time."""
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    job_id = f"no-agent-ledger-{case}"
+    execution = executions.create_execution(job_id, source="builtin")
+    observed = []
+
+    def observe_script_boundary(job, _script_path, **_kwargs):
+        record = executions.latest_execution(job["id"])
+        assert record is not None
+        observed.append((record["status"], record["started_at"]))
+        return script_ok, script_output
+
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script_with_claim_heartbeat",
+        observe_script_boundary,
+    )
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
+
+    job = {
+        "id": job_id,
+        "name": "no-agent ledger probe",
+        "no_agent": True,
+        "script": "probe.py",
+        "execution_id": execution["id"],
+    }
+    assert scheduler.run_one_job(job) is True
+
+    terminal = executions.latest_execution(job_id)
+    assert terminal is not None
+    assert observed == [("running", terminal["started_at"])]
+    assert terminal["status"] == expected_status
+    assert terminal["started_at"] is not None
+    assert terminal["finished_at"] is not None
+    assert (terminal["error"] is None) is script_ok
+
+
+@pytest.mark.parametrize(
+    "script_output",
+    ['{"wakeAgent": false}', ""],
+    ids=("wake-agent-false", "empty-output"),
+)
+def test_agent_prerun_script_marks_execution_running_before_work(
+    monkeypatch, tmp_path, script_output
+):
+    """Agent pre-run scripts cross claimed -> running before any script work."""
+    import cron.scheduler as scheduler
+    import hermes_state
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    job_id = f"agent-prerun-{script_output != ''}"
+    execution = executions.create_execution(job_id, source="builtin")
+    observed = []
+
+    def observe_script_boundary(job, _script_path, **_kwargs):
+        record = executions.latest_execution(job["id"])
+        observed.append((record["status"], record["started_at"]))
+        return True, script_output
+
+    def unexpected_agent(*_args, **_kwargs):
+        raise AssertionError("agent must not start for a silent pre-run script")
+
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script_with_claim_heartbeat",
+        observe_script_boundary,
+    )
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: object())
+    monkeypatch.setattr("run_agent.AIAgent", unexpected_agent)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
+
+    job = {
+        "id": job_id,
+        "name": "agent pre-run ledger probe",
+        "prompt": "analyze script output",
+        "script": "probe.py",
+        "execution_id": execution["id"],
+    }
+    assert scheduler.run_one_job(job) is True
+
+    terminal = executions.latest_execution(job_id)
+    assert terminal is not None
+    assert observed == [("running", terminal["started_at"])]
+    assert terminal["status"] == "completed"
+    assert terminal["started_at"] is not None
+    assert terminal["finished_at"] is not None
+    assert terminal["error"] is None
+
+
+def test_parallel_run_one_job_start_callbacks_do_not_cross_execution_ids(
+    monkeypatch, tmp_path
+):
+    """Parallel workers must mark only their own durable execution running."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    jobs = []
+    for suffix in ("a", "b"):
+        job_id = f"parallel-callback-{suffix}"
+        execution = executions.create_execution(job_id, source="builtin")
+        jobs.append({"id": job_id, "execution_id": execution["id"]})
+
+    rendezvous = threading.Barrier(2)
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        del defer_agent_teardown
+        rendezvous.wait(timeout=5)
+        scheduler._notify_cron_execution_started()
+        return True, f"full:{job['id']}", f"done:{job['id']}", None
+
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(scheduler.run_one_job, jobs))
+
+    assert results == [True, True]
+    for job in jobs:
+        terminal = executions.latest_execution(job["id"])
+        assert terminal is not None
+        assert terminal["status"] == "completed"
+        assert terminal["started_at"] is not None
+        assert terminal["finished_at"] is not None
+
+
+def test_run_one_job_restores_prior_start_callback_on_success_and_exception(
+    monkeypatch, tmp_path
+):
+    """Worker reuse must not leak a prior execution-start callback."""
+    import cron.scheduler as scheduler
+
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "_is_interrupted", lambda _job_id: False)
+    monkeypatch.setattr(scheduler, "_consume_interrupted_flag", lambda _job_id: False)
+
+    sentinel_calls = []
+
+    def sentinel():
+        sentinel_calls.append("leaked")
+
+    token = scheduler._execution_started_callback.set(sentinel)
+    try:
+        success_execution = executions.create_execution(
+            "callback-restore-success", source="builtin"
+        )
+
+        def successful_run_job(_job, *, defer_agent_teardown=None):
+            del defer_agent_teardown
+            scheduler._notify_cron_execution_started()
+            return True, "full", "done", None
+
+        monkeypatch.setattr(scheduler, "run_job", successful_run_job)
+        assert scheduler.run_one_job(
+            {
+                "id": "callback-restore-success",
+                "execution_id": success_execution["id"],
+            }
+        )
+        assert scheduler._execution_started_callback.get() is sentinel
+
+        failed_execution = executions.create_execution(
+            "callback-restore-failure", source="builtin"
+        )
+
+        def failing_run_job(_job, *, defer_agent_teardown=None):
+            del defer_agent_teardown
+            raise RuntimeError("probe failure")
+
+        monkeypatch.setattr(scheduler, "run_job", failing_run_job)
+        assert not scheduler.run_one_job(
+            {
+                "id": "callback-restore-failure",
+                "execution_id": failed_execution["id"],
+            }
+        )
+        assert scheduler._execution_started_callback.get() is sentinel
+        assert sentinel_calls == []
+    finally:
+        scheduler._execution_started_callback.reset(token)
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

@@ -83,6 +83,10 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    # True when the turn deadline fired while codex was still working and we
+    # delivered its last assistant message anyway. The text is real but is NOT
+    # an answer to the request; callers must not treat it as a completed turn.
+    truncated: bool = False
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -277,6 +281,7 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        thread_name: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -286,6 +291,7 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._thread_name = str(thread_name or "").strip() or None
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -364,6 +370,20 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        if self._thread_name:
+            try:
+                self._client.request(
+                    "thread/name/set",
+                    {"threadId": self._thread_id, "name": self._thread_name},
+                    timeout=10,
+                )
+            except (CodexAppServerError, TimeoutError) as exc:
+                logger.warning(
+                    "codex app-server thread naming failed: id=%s name=%r error=%s",
+                    self._thread_id[:8],
+                    self._thread_name,
+                    exc,
+                )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
             self._thread_id[:8],
@@ -566,6 +586,8 @@ class CodexAppServerSession:
         # within post_tool_quiet_timeout and the turn hasn't completed, we
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
+        # Monotonic stamp of the last notification belonging to this turn.
+        last_activity_at: float = time.monotonic()
 
         while time.monotonic() < deadline and not turn_complete:
             if self._interrupt_event.is_set():
@@ -692,6 +714,12 @@ class CodexAppServerSession:
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 
+            # This notification belongs to our turn, so codex is demonstrably
+            # still working. Used at the deadline to tell "codex finished but
+            # never sent turn/completed" (quiet) from "codex was mid-work when
+            # the clock ran out" (truncated).
+            last_activity_at = time.monotonic()
+
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)
 
@@ -763,12 +791,56 @@ class CodexAppServerSession:
             and result.final_text
             and result.error is None
         ):
-            logger.warning(
-                "codex app-server turn reached deadline after a completed "
-                "assistant message but before turn/completed; accepting "
-                "the assistant text as the terminal response"
-            )
-            turn_complete = True
+            # The deadline landed after codex emitted an assistant message but
+            # before turn/completed. Two very different situations reach here,
+            # and treating them alike is what shipped a mid-work note to Slack
+            # as a final answer (2026-07-28, 12:14 and 19:31):
+            #
+            #   a) codex ANSWERED and then went quiet, simply omitting
+            #      turn/completed. The text is the real reply — recover it.
+            #   b) codex was STILL WORKING when the clock ran out. The text is
+            #      the last thing it happened to say, not an answer.
+            #
+            # Tell them apart by whether codex was still emitting notifications
+            # for this turn as the deadline approached. The silence window is
+            # the existing post-tool quiet constant (the file's established
+            # "codex has stopped" threshold), clamped to half the budget so a
+            # short-budget caller/test still gets a meaningful window.
+            quiet_window = min(post_tool_quiet_timeout, turn_timeout / 2.0)
+            went_quiet = (time.monotonic() - last_activity_at) >= quiet_window
+
+            if went_quiet:
+                logger.warning(
+                    "codex app-server turn reached deadline after a completed "
+                    "assistant message but before turn/completed; codex was "
+                    "silent for >=%.1fs so accepting the assistant text as "
+                    "the terminal response",
+                    quiet_window,
+                )
+                turn_complete = True
+            else:
+                # Deliver the text — it is real work — but record the turn as
+                # UNFINISHED. error set => completed=False/partial=True, so the
+                # caller keeps resume_pending armed and memory/skill review
+                # skip the partial transcript. Retire the session: codex that
+                # never reached turn/completed must not be inherited.
+                logger.warning(
+                    "codex app-server turn reached deadline (%.0fs) while "
+                    "codex was still active (last signal %.1fs ago); "
+                    "delivering the assistant text but marking the turn "
+                    "TRUNCATED (not a final answer)",
+                    turn_timeout,
+                    time.monotonic() - last_activity_at,
+                )
+                self._issue_interrupt(result.turn_id)
+                turn_complete = True
+                result.truncated = True
+                result.error = (
+                    f"turn truncated: codex was still working when the "
+                    f"{turn_timeout:.0f}s turn deadline fired; the text above "
+                    f"is the last message it emitted, not a completed answer"
+                )
+                result.should_retire = True
 
         if not turn_complete and not result.interrupted:
             # Hit the deadline. Issue interrupt to stop wasted compute, and

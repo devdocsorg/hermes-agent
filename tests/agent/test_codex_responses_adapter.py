@@ -537,3 +537,207 @@ def test_normalize_codex_response_xai_reasoning_without_marker_stays_incomplete(
 
     assert finish_reason == "incomplete"
     assert assistant_message.content == ""
+
+
+# ---------------------------------------------------------------------------
+# call_id length limit (2026-07-28 production incident)
+# ---------------------------------------------------------------------------
+
+# A real id measured from ~/.hermes/sessions on 2026-07-28 (84 chars).
+_REAL_LONG_CALL_ID = (
+    "codex_mcp__devdocs__slack_v2_list_conversation_history_"
+    "call_DMWyho6rDTCj8bAAZjLztQ0b"
+)
+
+
+def test_preflight_clamps_over_long_call_id():
+    """The Responses API rejects call_id > 64 chars with a non-retryable 400.
+
+    Hermes' projector mints `codex_mcp__<server>__<tool>_<id>` correlation ids
+    that measured 76-84 chars on real sessions, which produced 147 dropped
+    background-review turns in one day.
+    """
+    assert len(_REAL_LONG_CALL_ID) > 64, "fixture must actually overflow"
+
+    items = _preflight_codex_input_items(
+        [
+            {
+                "type": "function_call",
+                "call_id": _REAL_LONG_CALL_ID,
+                "name": "slack_v2_list_conversation_history",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": _REAL_LONG_CALL_ID,
+                "output": "ok",
+            },
+        ]
+    )
+
+    assert len(items) == 2
+    for item in items:
+        assert len(item["call_id"]) <= 64
+
+    # The pairing MUST survive the clamp — otherwise a length error is simply
+    # traded for "no tool output found for function call".
+    assert items[0]["call_id"] == items[1]["call_id"]
+
+
+def test_preflight_clamp_is_deterministic_and_collision_free():
+    """Same id in, same id out; different ids stay different."""
+    other = _REAL_LONG_CALL_ID.replace("slack_v2", "slack_v3")
+
+    first = _preflight_codex_input_items(
+        [{"type": "function_call_output", "call_id": _REAL_LONG_CALL_ID, "output": ""}]
+    )[0]["call_id"]
+    second = _preflight_codex_input_items(
+        [{"type": "function_call_output", "call_id": _REAL_LONG_CALL_ID, "output": ""}]
+    )[0]["call_id"]
+    third = _preflight_codex_input_items(
+        [{"type": "function_call_output", "call_id": other, "output": ""}]
+    )[0]["call_id"]
+
+    assert first == second, "clamp must be stable across calls (prefix caching)"
+    assert first != third, "distinct ids must not collide"
+
+
+def test_preflight_leaves_short_call_id_untouched():
+    """Ids already within the limit must pass through byte-for-byte."""
+    short = "call_abc123"
+    items = _preflight_codex_input_items(
+        [
+            {"type": "function_call", "call_id": short, "name": "f", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": short, "output": "ok"},
+        ]
+    )
+    assert [i["call_id"] for i in items] == [short, short]
+
+
+# Real dotted MCP names measured in ~/.hermes/sessions on 2026-07-28. The
+# Responses API rejects these with
+#   "Invalid 'input[44].name': string does not match pattern '^[a-zA-Z0-9_-]+$'"
+_REAL_DOTTED_NAMES = [
+    "mcp.devdocs.notion_search",
+    "mcp.hermes-tools.skill_view",
+    "mcp.node_repl.js",
+]
+
+
+@pytest.mark.parametrize("dotted", _REAL_DOTTED_NAMES)
+def test_preflight_sanitizes_dotted_tool_name_in_history(dotted):
+    items = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": "call_x", "name": dotted, "arguments": "{}"}]
+    )
+    import re as _re
+    assert _re.fullmatch(r"[a-zA-Z0-9_-]+", items[0]["name"]), items[0]["name"]
+
+
+def test_tool_definition_and_history_name_sanitize_identically():
+    """The definition and the replayed call MUST end up with the SAME name.
+
+    Sanitizing only one side would trade a pattern error for a model that can
+    no longer match its own tool call to a declared tool.
+    """
+    dotted = "mcp.devdocs.slack_v2_list_conversation_history"
+
+    from_history = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": "call_x", "name": dotted, "arguments": "{}"}]
+    )[0]["name"]
+
+    kwargs = _preflight_codex_api_kwargs(
+        {
+            "model": "codex-auto",
+            "instructions": "be helpful",
+            "input": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": dotted,
+                    "description": "d",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "store": False,
+        }
+    )
+    from_definition = kwargs["tools"][0]["name"]
+
+    assert from_history == from_definition == "mcp_devdocs_slack_v2_list_conversation_history"
+
+
+def test_preflight_leaves_legal_tool_name_untouched():
+    legal = "slack_v2_list_conversation_history"
+    items = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": "c", "name": legal, "arguments": "{}"}]
+    )
+    assert items[0]["name"] == legal
+
+
+def test_chat_to_responses_converter_clamps_call_id_and_name():
+    """The converter is a SECOND entry point that skips the preflight.
+
+    Regression for 2026-07-28 22:43: after clamping only in
+    _preflight_codex_input_items, the iteration-limit summary path
+    (agent/chat_completion_helpers.py -> chat.completions.create) still emitted
+    a 65-char call_id and produced the same non-retryable 400 in production.
+    """
+    long_id = _REAL_LONG_CALL_ID
+    dotted = "mcp.devdocs.slack_v2_list_conversation_history"
+    assert len(long_id) > 64
+
+    items = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": long_id,
+                        "call_id": long_id,
+                        "type": "function",
+                        "function": {"name": dotted, "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": long_id, "content": "result"},
+        ]
+    )
+
+    calls = [i for i in items if i.get("type") == "function_call"]
+    outputs = [i for i in items if i.get("type") == "function_call_output"]
+    assert calls and outputs
+
+    import re as _re
+    for i in calls + outputs:
+        assert len(i["call_id"]) <= 64, i["call_id"]
+    for i in calls:
+        assert _re.fullmatch(r"[a-zA-Z0-9_-]+", i["name"]), i["name"]
+
+    # call and its output must still refer to the same id
+    assert calls[0]["call_id"] == outputs[0]["call_id"]
+
+
+def test_converter_and_preflight_agree_on_the_same_id():
+    """Both entry points must map one input id to one identical output id."""
+    long_id = _REAL_LONG_CALL_ID
+    via_converter = _chat_messages_to_responses_input(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": long_id,
+                        "call_id": long_id,
+                        "type": "function",
+                        "function": {"name": "f", "arguments": "{}"},
+                    }
+                ],
+            }
+        ]
+    )[0]["call_id"]
+    via_preflight = _preflight_codex_input_items(
+        [{"type": "function_call", "call_id": long_id, "name": "f", "arguments": "{}"}]
+    )[0]["call_id"]
+    assert via_converter == via_preflight

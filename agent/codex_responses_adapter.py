@@ -544,10 +544,19 @@ def _chat_messages_to_responses_input(
                             arguments = str(arguments)
                         arguments = arguments.strip() or "{}"
 
+                        # Clamp/sanitize HERE as well as in the preflight:
+                        # this converter feeds callers that do NOT go through
+                        # _preflight_codex_input_items (e.g. the iteration-limit
+                        # summary in agent/chat_completion_helpers.py, which
+                        # calls chat.completions.create directly). Fixing only
+                        # the preflight left that path still emitting 65-char
+                        # ids — observed live 2026-07-28 22:43 AFTER the first
+                        # fix shipped. Same pure functions, so both entry points
+                        # produce identical ids and the pairing holds.
                         items.append({
                             "type": "function_call",
-                            "call_id": call_id,
-                            "name": fn_name,
+                            "call_id": _clamp_responses_call_id(call_id),
+                            "name": _sanitize_responses_tool_name(fn_name),
                             "arguments": arguments,
                         })
                 continue
@@ -589,7 +598,9 @@ def _chat_messages_to_responses_input(
 
             items.append({
                 "type": "function_call_output",
-                "call_id": call_id,
+                # Must use the SAME clamp as the function_call above, or the
+                # output no longer pairs with its call.
+                "call_id": _clamp_responses_call_id(call_id),
                 "output": output_value,
             })
 
@@ -599,6 +610,52 @@ def _chat_messages_to_responses_input(
 # ---------------------------------------------------------------------------
 # Input preflight / validation
 # ---------------------------------------------------------------------------
+
+# The Responses API rejects a call_id longer than 64 characters:
+#   "Invalid 'input[1].call_id': string too long. Expected a string with
+#    maximum length 64, but got a string with length 65 instead."
+# Hermes' own projector mints correlation ids as
+# `codex_{item_type}_{item_id}` (codex_event_projector._deterministic_call_id),
+# and for MCP tools item_type is `mcp__<server>__<tool>` — measured on real
+# sessions those run 76-84 characters, e.g.
+#   codex_mcp__devdocs__slack_v2_list_conversation_history_call_DMWyho6...
+# So ANY MCP tool call with a longish name blows the limit; the 65-char case
+# in the logs was simply the shortest overflow. On 2026-07-28 this produced
+# 147 non-retryable 400s across 60 background-review threads.
+_MAX_RESPONSES_CALL_ID = 64
+
+# The Responses API also constrains function NAMES:
+#   "Invalid 'input[44].name': string does not match pattern.
+#    Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'."
+# Hermes' MCP tool names are DOTTED (measured in real sessions:
+# mcp.devdocs.notion_search, mcp.hermes-tools.skill_view, mcp.node_repl.js),
+# and a dot is not in that class — 24 more non-retryable 400s over 2026-07-27/28.
+_RESPONSES_NAME_ALLOWED = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_responses_tool_name(name: str) -> str:
+    """Coerce a tool name into the Responses API's allowed character class.
+
+    MUST be pure and deterministic: it is applied independently to the tool
+    DEFINITIONS and to the function_call items replayed from history, and the
+    two only stay correlated if both map the same input to the same output.
+    """
+    return _RESPONSES_NAME_ALLOWED.sub("_", name)
+
+
+def _clamp_responses_call_id(call_id: str) -> str:
+    """Fit a call_id inside the Responses API's 64-char limit.
+
+    MUST be deterministic and pure: the function_call and its matching
+    function_call_output are clamped independently, so a non-deterministic
+    scheme would break the pairing and trade a length error for a
+    "no tool output found for function call" error.
+    """
+    if len(call_id) <= _MAX_RESPONSES_CALL_ID:
+        return call_id
+    digest = hashlib.sha256(call_id.encode("utf-8", errors="replace")).hexdigest()[:48]
+    return f"call_{digest}"
+
 
 def _preflight_codex_input_items(
     raw_items: Any,
@@ -633,8 +690,8 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call",
-                    "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "call_id": _clamp_responses_call_id(call_id.strip()),
+                    "name": _sanitize_responses_tool_name(name.strip()),
                     "arguments": arguments,
                 }
             )
@@ -674,7 +731,7 @@ def _preflight_codex_input_items(
                 normalized.append(
                     {
                         "type": "function_call_output",
-                        "call_id": call_id.strip(),
+                        "call_id": _clamp_responses_call_id(call_id.strip()),
                         "output": cleaned if cleaned else "",
                     }
                 )
@@ -685,7 +742,7 @@ def _preflight_codex_input_items(
             normalized.append(
                 {
                     "type": "function_call_output",
-                    "call_id": call_id.strip(),
+                    "call_id": _clamp_responses_call_id(call_id.strip()),
                     "output": output,
                 }
             )
@@ -884,6 +941,9 @@ def _preflight_codex_api_kwargs(
                 raise ValueError(f"Codex Responses tools[{idx}] is missing a valid name.")
             if not isinstance(parameters, dict):
                 raise ValueError(f"Codex Responses tools[{idx}] is missing valid parameters.")
+            # Same sanitizer as the replayed function_call items, so a dotted
+            # MCP name maps to one identical legal name on BOTH sides.
+            name = _sanitize_responses_tool_name(name.strip())
 
             description = tool.get("description", "")
             if description is None:

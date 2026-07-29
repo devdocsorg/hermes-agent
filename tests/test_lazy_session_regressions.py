@@ -347,6 +347,58 @@ class TestGatewaySurfacesNullResponse:
         assert response != "", "Null response with api_calls>0 must be surfaced"
         assert "nonexistent_tool" in response
 
+    def test_truncated_response_is_labelled_not_shipped_as_final(self):
+        """A deadline-truncated turn HAS text, and that text must not read as
+        a finished answer.
+
+        Production, 2026-07-28: a codex turn hit the 600s wall mid-work and the
+        gateway posted its last internal narration to Slack as the reply, twice
+        (12:14 and 19:31). The text is worth keeping — the claim of
+        completeness is not.
+        """
+        from gateway.run import _normalize_empty_agent_response
+
+        mid_work_note = (
+            "I'm using the authenticated Slack web session to locate the "
+            "unique parent message, then I'll return to the API"
+        )
+        agent_result = {
+            "final_response": mid_work_note,
+            "api_calls": 7,
+            "partial": True,
+            "truncated": True,
+            "interrupted": False,
+            "error": "turn truncated: codex was still working",
+        }
+
+        response = _normalize_empty_agent_response(
+            agent_result, mid_work_note, history_len=40,
+        )
+
+        # The work survives...
+        assert mid_work_note in response
+        # ...but it is explicitly not presented as the answer.
+        assert "cut off" in response.lower()
+        assert response != mid_work_note
+
+    def test_untruncated_response_is_passed_through_unchanged(self):
+        """The label must attach ONLY to truncated turns — a normal reply is
+        returned byte-for-byte."""
+        from gateway.run import _normalize_empty_agent_response
+
+        answer = "Here are your three standup items: ..."
+        agent_result = {
+            "final_response": answer,
+            "api_calls": 3,
+            "partial": False,
+            "truncated": False,
+            "interrupted": False,
+        }
+
+        assert _normalize_empty_agent_response(
+            agent_result, answer, history_len=40,
+        ) == answer
+
     def test_interrupted_response_stays_empty(self):
         """Interrupted agent → response stays empty (platform handles UX)."""
         from gateway.run import _normalize_empty_agent_response

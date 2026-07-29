@@ -338,7 +338,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_environment(tmp_path, monkeypatch):
+def _hermetic_environment(tmp_path, monkeypatch, request):
     """Blank out all credential/behavioral env vars so local and CI match.
 
     Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
@@ -378,6 +378,30 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+
+    # Tests using @patch.dict(os.environ, ..., clear=True) temporarily remove
+    # HERMES_HOME *inside* the test body, after this fixture has run. Keep the
+    # platform-default fallback pinned to the same sandbox so runtime identity
+    # writers (notably gateway.status) cannot fall through to real ~/.hermes.
+    import hermes_constants as _hermes_constants
+    from gateway import status as _gateway_status
+
+    # The resolver's own contract tests must exercise the real implementation;
+    # they explicitly redirect Path.home/environment themselves. Sandboxing the
+    # helper there would replace the exact behavior under test.
+    tests_real_home_resolver = request.node.path.name == "test_hermes_constants.py"
+    if not tests_real_home_resolver:
+        monkeypatch.setattr(
+            _hermes_constants,
+            "_get_platform_default_hermes_home",
+            lambda: fake_hermes_home,
+        )
+        # gateway.status imports the helper by value, so patch that bound alias too.
+        monkeypatch.setattr(
+            _gateway_status,
+            "_get_platform_default_hermes_home",
+            lambda: fake_hermes_home,
+        )
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

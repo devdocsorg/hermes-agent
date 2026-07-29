@@ -6,11 +6,34 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from gateway import status
+from hermes_constants import (
+    _get_platform_default_hermes_home as _real_platform_default_hermes_home,
+)
 
 
 class TestGatewayPidState:
+    def test_real_platform_default_home_without_test_sandbox(self, tmp_path):
+        """The autouse sandbox must not hide regressions in the real resolver."""
+        with patch.object(Path, "home", return_value=tmp_path), patch.dict(
+            os.environ, {}, clear=True
+        ):
+            resolved = _real_platform_default_hermes_home()
+
+        if sys.platform == "win32":
+            assert resolved == tmp_path / "AppData" / "Local" / "hermes"
+        else:
+            assert resolved == tmp_path / ".hermes"
+
+    def test_hermetic_fallback_survives_clear_environment_patch(self):
+        """Platform tests that clear os.environ must not reach real ~/.hermes."""
+        isolated_home = Path(os.environ["HERMES_HOME"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            assert status._get_process_hermes_home() == isolated_home
+
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
