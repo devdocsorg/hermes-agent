@@ -58,6 +58,16 @@ class TurnRetryState:
     # ── Transport / rate-limit recovery ──────────────────────────────────
     primary_recovery_attempted: bool = False
     has_retried_429: bool = False
+    # Clock-driven retry extensions granted for a transport-class outage
+    # (see agent/retry_utils.should_extend_transport_retry). Counted so a
+    # permanently dead endpoint still terminates instead of retrying forever.
+    transport_retry_extensions: int = 0
+    # How many times the attempt budget has been exhausted during this API
+    # call. The FIRST exhaustion belongs to the existing recovery ladder
+    # (rebuild the primary transport, then walk the fallback chain) — a
+    # healthy fallback provider beats any amount of patience. Only once that
+    # ladder is spent does the wall clock take over.
+    budget_exhaustions: int = 0
 
     # ── Auth-failure provider failover ───────────────────────────────────
     # Set once we've escalated a persistent 401/403 (after the per-provider

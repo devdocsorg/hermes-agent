@@ -5090,6 +5090,21 @@ class BasePlatformAdapter(ABC):
             state.task.cancel()
 
         delay = self._text_debounce_delay(session_key)
+        # A deferred human message must leave a trace at INFO. On 2026-07-27 an
+        # operator asked "I don't see you continuing" at 20:04; the message was
+        # buffered here behind a 28-minute turn and produced ZERO log output at
+        # the gateway's INFO level, so reconstructing where it went took an hour
+        # of log archaeology. "inbound message: ..." is only logged once a
+        # message actually gets a turn, which makes this the only record that
+        # it arrived at all.
+        logger.info(
+            "[%s] Busy-queue: buffering follow-up text for session %s "
+            "(flush in %.1fs, %d chars) — no turn starts until the current run ends",
+            self.name,
+            session_key,
+            delay,
+            len(state.event.text or ""),
+        )
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
 
     async def _flush_text_debounce(self, session_key: str, delay: float) -> None:

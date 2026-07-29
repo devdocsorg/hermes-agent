@@ -83,6 +83,13 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # wall deadlines plus readiness; other platforms retain the 30s isolation bound.
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# How long a long-running heartbeat may be edited in place before it is
+# re-POSTED as a new message. An edit produces no notification, no unread badge
+# and keeps the original timestamp, so a run that only ever edits looks frozen:
+# on 2026-07-27 a healthy Slack run posted at 19:40:32 and was still editing
+# that bubble at 20:06:35, and the operator reported it dead. Frequent updates
+# stay edits (cheap, no spam); crossing this interval forces one visible message.
+HEARTBEAT_REPOST_INTERVAL_SECONDS = 600.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -904,11 +911,30 @@ def _is_fresh_gateway_interruption(
     return current - timestamp <= window
 
 
+def _resume_continues_work() -> bool:
+    """Whether a resumed interactive turn continues its task or asks first.
+
+    Read per call (config.yaml is mtime-cached) so flipping
+    ``agent.resume_continues_work`` takes effect without a gateway restart.
+    Fails OPEN to continuing: the whole point is that an interrupted
+    workstream must not need a human to re-authorise it.
+    """
+    try:
+        agent_cfg = (_load_gateway_config().get("agent") or {})
+        value = agent_cfg.get("resume_continues_work", True)
+    except Exception:
+        return True
+    if value is None:
+        return True
+    return bool(is_truthy_value(value) if isinstance(value, str) else value)
+
+
 def build_resume_recovery_note(
     reason: Optional[str],
     message: str = "",
     *,
     interactive: bool = True,
+    continue_work: bool = True,
 ) -> str:
     """Build the resume-pending recovery system note for an interrupted turn.
 
@@ -925,6 +951,19 @@ def build_resume_recovery_note(
     resumed turn must instead complete the interrupted work, or the task is
     silently abandoned behind a "restored" acknowledgement that goes
     nowhere (#57056).
+
+    ``continue_work`` extends that same #57056 reasoning to interactive
+    platforms, where "a human is present" is not the same as "a human is
+    waiting to re-authorise the work".  A long autonomous workstream in a DM
+    hits this on every gateway restart: the task was mid-flight, the resumed
+    turn answers "The session was restored successfully. What would you like
+    to do next?", and the workstream is dead until someone types "keep going".
+    That happened for real on 2026-07-27 — restart at 20:30:56, that exact
+    sentence at 20:31:53 — and the operator's thread is full of "Keep going",
+    "Why did you stop keep going", "don't wait for me". So by default the
+    resumed turn says one line about what it is picking up and then continues.
+    Set ``agent.resume_continues_work: false`` to restore the ask-first
+    behavior.
     """
     reason_phrase = (
         "a gateway restart"
@@ -941,6 +980,20 @@ def build_resume_recovery_note(
         tail_guidance = (
             "Do NOT re-execute old tool calls — skip any "
             "unfinished work from the conversation history."
+        )
+    elif interactive and continue_work:
+        resume_guidance = (
+            "Say in ONE short line what you are picking back up, then "
+            "CONTINUE the interrupted task to completion. Do NOT stop to "
+            "ask what the user would like to do next and do NOT wait for "
+            "permission — this work was already in flight and nobody has "
+            "cancelled it. Only ask a question if you are genuinely blocked "
+            "on something only the user can supply."
+        )
+        tail_guidance = (
+            "Do NOT re-run tool calls whose results already "
+            "appear in the history — resume from the first step "
+            "that has no recorded result."
         )
     elif interactive:
         resume_guidance = (
@@ -2011,6 +2064,10 @@ if _config_path.exists():
                 os.environ["HERMES_AGENT_TIMEOUT_WARNING"] = str(_agent_cfg["gateway_timeout_warning"])
             if "gateway_notify_interval" in _agent_cfg:
                 os.environ["HERMES_AGENT_NOTIFY_INTERVAL"] = str(_agent_cfg["gateway_notify_interval"])
+            if "gateway_notify_repost_interval" in _agent_cfg:
+                os.environ["HERMES_AGENT_NOTIFY_REPOST_INTERVAL"] = str(
+                    _agent_cfg["gateway_notify_repost_interval"]
+                )
             if "restart_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_RESTART_DRAIN_TIMEOUT"] = str(_agent_cfg["restart_drain_timeout"])
             if "gateway_auto_continue_freshness" in _agent_cfg:
@@ -2645,6 +2702,29 @@ def _dequeue_pending_event(adapter, session_key: str) -> MessageEvent | None:
     to a placeholder string.
     """
     return adapter.get_pending_message(session_key)
+
+
+_MAX_AUTOMATIC_CONTINUATIONS = 3
+_AUTOMATIC_CONTINUATION_PROMPT = (
+    "[HERMES AUTOMATIC CONTINUATION: previous turn reached its tool-iteration limit]\n"
+    "Continue the user's unresolved task from the current session and filesystem state. "
+    "Do not merely restate the checkpoint. Carry the authorized work through implementation, "
+    "verification, and activation. Preserve any newer user steering and all safety constraints."
+)
+
+
+def _automatic_continuation_for_result(result: dict, depth: int) -> str | None:
+    """Return a bounded synthetic follow-up for an incomplete budget exit."""
+    if depth >= _MAX_AUTOMATIC_CONTINUATIONS:
+        return None
+    if result.get("completed") is not False:
+        return None
+    if result.get("failed") or result.get("interrupted"):
+        return None
+    reason = str(result.get("turn_exit_reason") or "")
+    if not reason.startswith("max_iterations_reached("):
+        return None
+    return _AUTOMATIC_CONTINUATION_PROMPT
 
 
 _INTERRUPT_REASON_STOP = "Stop requested"
@@ -7576,7 +7656,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # .clean_shutdown marker).  All three mean "the agent was mid-turn and
     # we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
-        {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
+        {
+            "restart_timeout",
+            "shutdown_timeout",
+            "restart_interrupted",
+            # A turn that hit its iteration budget left the task unfinished.
+            # The in-process continuation covers it while THIS process lives;
+            # this entry is what makes it survive a restart, so the work is
+            # picked back up on the next boot instead of waiting for a human.
+            # Bounded by the same freshness window and restart-loop breaker as
+            # every other reason here.
+            "max_iterations",
+        }
     )
 
     async def _run_startup_resume_event(
@@ -7831,6 +7922,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
+
 
         ``resume_pending`` already preserves the transcript AND the existing
         ``_is_resume_pending`` branch in ``_handle_message_with_agent``
@@ -22866,6 +22958,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 message = build_resume_recovery_note(
                     _reason, message, interactive=_interactive_resume,
+                    continue_work=_resume_continues_work(),
                 )
             elif _has_fresh_tool_tail:
                 _persist_user_message_override = message
@@ -22913,6 +23006,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     interactive=bool(
                         getattr(_sn_adapter, "interactive_resume", True)
                     ),
+                    continue_work=_resume_continues_work(),
                 )
 
             _approval_session_key = session_key or ""
@@ -23127,6 +23221,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "partial": result.get("partial", False),
                     "truncated": result.get("truncated", False),
                     "completed": result.get("completed"),
+                    "turn_exit_reason": result.get("turn_exit_reason"),
                     "interrupted": result.get("interrupted", False),
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
@@ -23249,6 +23344,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result_holder[0].get("failure_reason") if result_holder[0] else None
                 ),
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
+                "turn_exit_reason": result_holder[0].get("turn_exit_reason") if result_holder[0] else None,
+                "failed": result_holder[0].get("failed", False) if result_holder[0] else False,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 # Carried so _normalize_empty_agent_response can label a
@@ -23423,6 +23520,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
+        # ── A permanent bubble is for a private conversation ─────────────
+        # Operator instruction (2026-07-27): "In channels with other people I
+        # just want to see the typing indicator that it's doing stuff." The
+        # ephemeral status line (display live_status) already says "working"
+        # in a shared channel and costs nobody a message; a persistent
+        # "Working — N min" bubble there is noise for every other member.
+        # In a DM-style conversation there is no bystander to annoy, the
+        # status line disappears the moment you look away, and a silent run
+        # is indistinguishable from a dead one — which is exactly the report
+        # that started this. So the bubble is DM-only.
+        # Gated on the existing chat_type field rather than a freshly-invented
+        # "is the operator alone here" classifier: chat_type is "dm" for 1:1
+        # and group DMs and "group"/"channel" for channels, which is the split
+        # asked for. HERMES_AGENT_NOTIFY_CHANNEL_HEARTBEAT=1 restores the old
+        # everywhere behavior.
+        if _NOTIFY_INTERVAL is not None and not is_truthy_value(
+            os.environ.get("HERMES_AGENT_NOTIFY_CHANNEL_HEARTBEAT")
+        ):
+            _chat_type = str(getattr(source, "chat_type", "") or "").lower()
+            if _chat_type not in {"dm", "thread"}:
+                logger.debug(
+                    "Long-running heartbeat suppressed for shared chat "
+                    "(chat_type=%r) — the ephemeral status line covers it",
+                    _chat_type,
+                )
+                _NOTIFY_INTERVAL = None
         _notify_start = time.time()
 
         async def _notify_long_running():
@@ -23437,6 +23560,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # interval. Falls back to send-new when edit fails or isn't
             # supported by the adapter.
             _heartbeat_msg_id: Optional[str] = None
+            # ── An edit is not a notification ────────────────────────────
+            # Editing one bubble forever is silent by design: the chat shows
+            # no new message, no unread badge, and the bubble keeps its
+            # original timestamp. Observed 2026-07-27: a Slack run posted its
+            # heartbeat at 19:40:32 and was still editing that same bubble at
+            # 20:06:35 ("Working — 28 min — iteration 67/90"). The run was
+            # healthy and doing real work the whole time, but to the operator
+            # the thread had been frozen for 26 minutes and they reported it
+            # dead. So re-POST on a slower cadence: edits stay cheap for
+            # minute-to-minute updates, and a long run still produces a real,
+            # timestamped, unread-generating message periodically.
+            _heartbeat_posted_at = 0.0
+            _REPOST_INTERVAL_RAW = _float_env(
+                "HERMES_AGENT_NOTIFY_REPOST_INTERVAL",
+                HEARTBEAT_REPOST_INTERVAL_SECONDS,
+            )
+            _REPOST_INTERVAL = (
+                _REPOST_INTERVAL_RAW if _REPOST_INTERVAL_RAW > 0 else None
+            )
             while True:
                 await asyncio.sleep(_NOTIFY_INTERVAL)
                 # Stop heartbeating once this run no longer owns the session
@@ -23488,6 +23630,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _long_running_mode == "generic"
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
+                # Retire a bubble that has been silently edited for too long,
+                # so the next write is a real message the operator can see.
+                if (
+                    _heartbeat_msg_id
+                    and _REPOST_INTERVAL is not None
+                    and (time.time() - _heartbeat_posted_at) >= _REPOST_INTERVAL
+                ):
+                    logger.info(
+                        "Re-posting long-running heartbeat for session %s after "
+                        "%.0fs of in-place edits (an edit generates no "
+                        "notification)",
+                        session_key,
+                        time.time() - _heartbeat_posted_at,
+                    )
+                    _heartbeat_msg_id = None
                 try:
                     _notify_res = None
                     if _heartbeat_msg_id:
@@ -23510,6 +23667,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _notify_res, "message_id", None
                         ):
                             _heartbeat_msg_id = str(_notify_res.message_id)
+                            # Stamp when this bubble became the live one, so the
+                            # re-post clock measures how long it has been edited
+                            # rather than how long the run has been going.
+                            _heartbeat_posted_at = time.time()
                             if _cleanup_progress:
                                 _cleanup_msg_ids.append(_heartbeat_msg_id)
                 except Exception as _ne:
@@ -23871,6 +24032,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _leftover_steer:
                     pending = _leftover_steer
                     logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
+
+            # A max-iteration response is an explicit incomplete checkpoint, not
+            # successful task completion. Re-enter it through the same bounded
+            # pending-message path used for user follow-ups so the first response
+            # is delivered before continuation and source/thread routing is kept.
+            if result and not pending and not pending_event:
+                pending = _automatic_continuation_for_result(result, _interrupt_depth)
+                if pending:
+                    logger.warning(
+                        "Auto-continuing incomplete max-iteration turn for session %s "
+                        "at continuation depth %d",
+                        session_key or "?",
+                        _interrupt_depth + 1,
+                    )
+                    # Also record it durably. The in-process continuation above
+                    # only survives while THIS process does — a restart mid-way
+                    # (or a crash) loses it, and the workstream is then parked
+                    # until a human types "keep going". Marking resume_pending
+                    # hands the unfinished task to the same recovery path a
+                    # restart uses, so it is picked back up on the next boot.
+                    #
+                    # This is the behaviour tests/gateway/
+                    # test_max_iteration_auto_continue.py has specified since it
+                    # was written (from the operator's own stalled DM thread
+                    # 1785100271.344399) — the test was red because the
+                    # implementation never landed.
+                    if session_key:
+                        try:
+                            await self.async_session_store.mark_resume_pending(
+                                session_key, "max_iterations"
+                            )
+                        except Exception as _e:
+                            logger.debug(
+                                "mark_resume_pending(max_iterations) failed for "
+                                "%s: %s", session_key, _e,
+                            )
+                elif (
+                    result.get("completed") is False
+                    and str(result.get("turn_exit_reason") or "").startswith("max_iterations_reached(")
+                ):
+                    logger.error(
+                        "Automatic max-iteration continuation limit reached for session %s at depth %d",
+                        session_key or "?",
+                        _interrupt_depth,
+                    )
 
             # Safety net: if the pending text is a slash command (e.g. "/stop",
             # "/new"), discard it — commands should never be passed to the agent
