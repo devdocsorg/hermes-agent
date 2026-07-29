@@ -5691,6 +5691,20 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     return
             elif self._slack_strict_mention() and not is_mentioned:
+                # Log it. This branch used to drop a human's message with no
+                # record whatsoever — the only silent return in the whole gate.
+                # strict_mention is usually enabled long after the workspace was
+                # set up (on 2026-07-27 an agent turned it on mid-session via
+                # `hermes config set`), so "the bot stopped answering" is exactly
+                # the report it produces, and a silent drop makes that
+                # undiagnosable from the logs.
+                logger.info(
+                    "[Slack] Ignoring message without mention "
+                    "(strict_mention=true): channel=%s user=%s thread_ts=%s",
+                    channel_id,
+                    user_id,
+                    event_thread_ts,
+                )
                 return  # Strict mode: ignore until @-mentioned again
             elif (
                 self._slack_thread_require_mention()

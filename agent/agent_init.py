@@ -40,6 +40,7 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.process_bootstrap import _install_safe_stdio
+from agent.retry_utils import TRANSPORT_RETRY_FLOOR_SECONDS
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
@@ -1781,6 +1782,19 @@ def init_agent(
     except (TypeError, ValueError):
         _api_retries = 3
     agent._api_max_retries = _api_retries
+
+    # Wall-clock floor for waiting out a transport-class outage. The attempt
+    # count above spans only seconds, which is not resilience — see
+    # agent/retry_utils.py for the 2026-07-26 measurement that set this.
+    # 0 disables the floor and restores pure count-based behavior.
+    try:
+        _raw_floor = _agent_section.get(
+            "api_transport_retry_floor_seconds", TRANSPORT_RETRY_FLOOR_SECONDS
+        )
+        _transport_floor = max(0.0, float(_raw_floor))
+    except (TypeError, ValueError):
+        _transport_floor = TRANSPORT_RETRY_FLOOR_SECONDS
+    agent._api_transport_retry_floor_s = _transport_floor
 
     # Initialize context compressor for automatic context management
     # Compresses conversation when approaching model's context limit

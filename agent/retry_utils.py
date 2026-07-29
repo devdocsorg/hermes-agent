@@ -32,6 +32,71 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 # the two from silently desyncing if the short-retry count is ever tuned.
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
+# ── A retry budget is a DURATION, not a count ────────────────────────────────
+# Measured from a real outage rather than guessed. On 2026-07-26 the local
+# LiteLLM router at 127.0.0.1:4400 stopped accepting connections at 15:11:50
+# CDT. Every live Hermes session classified the failure correctly (transport,
+# retryable) and then spent its ENTIRE budget — 3 attempts, a primary-transport
+# rebuild, 3 more attempts — inside about 23 SECONDS (15:11:52 -> 15:12:15 for
+# session 20260725_073247_4cfee5c2). Seven sessions died that way in two
+# minutes, and one multi-hour workstream then sat silent for 28 hours until a
+# human noticed. No count would have saved them: three attempts that all land
+# inside the same half-minute are one attempt wearing a hat.
+#
+# So a transport-class failure is waited out on the CLOCK. The asymmetry is
+# what justifies it: waiting costs one idle session for a few minutes, while
+# giving up costs the whole turn and every tool call already paid for.
+#
+# Deliberately NOT applied to non-transport reasons — auth, billing, content
+# policy and context overflow are deterministic, and re-issuing them just
+# burns quota against a wall that will not move.
+TRANSPORT_RETRY_FLOOR_SECONDS = 300.0
+
+# Hard ceiling on clock-driven extensions, so a permanently dead endpoint still
+# terminates even if the caller passes an absurd floor. Each extension is
+# followed by the normal jittered backoff (capped at 60s), so this bounds the
+# patience window rather than defining it.
+TRANSPORT_RETRY_MAX_EXTENSIONS = 40
+
+# Reasons that describe "the wire broke", i.e. the class of failure where the
+# same request may well succeed unchanged once the far end comes back. Values
+# are ``FailoverReason`` .value strings; compared as strings so this module
+# stays free of a circular import on agent.error_classifier.
+TRANSPORT_RETRY_REASONS = frozenset({"timeout", "server_error", "overloaded"})
+
+
+def should_extend_transport_retry(
+    *,
+    reason: Any,
+    elapsed_s: float,
+    floor_s: float = TRANSPORT_RETRY_FLOOR_SECONDS,
+    extensions_used: int = 0,
+    max_extensions: int = TRANSPORT_RETRY_MAX_EXTENSIONS,
+) -> bool:
+    """Return True when a transport failure has not yet been waited out.
+
+    ``elapsed_s`` is the wall-clock time already spent on this one logical API
+    call (all attempts, backoffs and transport rebuilds). While that is below
+    ``floor_s`` the caller should grant one more attempt instead of declaring
+    the turn dead — that is the whole point: the budget is the clock, not the
+    attempt counter.
+
+    Pure and side-effect free so the policy can be tested without a provider.
+    """
+    if floor_s <= 0:
+        return False
+    if extensions_used >= max(0, max_extensions):
+        return False
+    reason_value = getattr(reason, "value", reason)
+    if not isinstance(reason_value, str):
+        return False
+    if reason_value not in TRANSPORT_RETRY_REASONS:
+        return False
+    try:
+        return float(elapsed_s) < float(floor_s)
+    except (TypeError, ValueError):
+        return False
+
 
 def jittered_backoff(
     attempt: int,
