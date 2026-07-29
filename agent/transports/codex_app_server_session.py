@@ -49,6 +49,51 @@ logger = logging.getLogger(__name__)
 _STDERR_TAIL_LINES = 12
 
 
+# Default wall clock for one codex app-server turn.
+#
+# 600s was a hard-coded literal with no override path, which made it a silent
+# ceiling on every autonomous workstream: measured 2026-07-29, two resumed
+# Slack sessions each ran the full 600s and were cut off mid-work, delivering a
+# partial answer that asked the operator to say "continue". That converts an
+# autonomous run into a babysitting job, which is exactly what the operator's
+# standing rule forbids.
+#
+# The default is UNCHANGED at 600s so existing behaviour is identical unless
+# an operator opts in; `agent.codex_turn_timeout` in config.yaml (bridged to
+# HERMES_CODEX_TURN_TIMEOUT) now makes it reachable. A turn deadline is a claim
+# about how long the work takes — state the measurement before changing it.
+_DEFAULT_CODEX_TURN_TIMEOUT = 600.0
+
+
+def _codex_turn_timeout_default() -> float:
+    """Resolve the per-turn wall clock, falling back to the 600s default.
+
+    Read per call (not at import) so a config change takes effect on the next
+    turn rather than requiring a gateway restart, matching how
+    ``_resume_continues_work`` is resolved in ``gateway/run.py``.
+    """
+    raw = os.environ.get("HERMES_CODEX_TURN_TIMEOUT")
+    if raw is None:
+        return _DEFAULT_CODEX_TURN_TIMEOUT
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring malformed HERMES_CODEX_TURN_TIMEOUT=%r; using %.0fs",
+            raw,
+            _DEFAULT_CODEX_TURN_TIMEOUT,
+        )
+        return _DEFAULT_CODEX_TURN_TIMEOUT
+    if value <= 0:
+        logger.warning(
+            "Ignoring non-positive HERMES_CODEX_TURN_TIMEOUT=%r; using %.0fs",
+            raw,
+            _DEFAULT_CODEX_TURN_TIMEOUT,
+        )
+        return _DEFAULT_CODEX_TURN_TIMEOUT
+    return value
+
+
 # Permission profile mapping mirrors the docstring in PR proposal:
 # Hermes' tools.terminal.security_mode → Codex's permissions profile id.
 # Defaults if config is missing → workspace-write (matches Codex's own default).
@@ -491,7 +536,7 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
-        turn_timeout: float = 600.0,
+        turn_timeout: Optional[float] = None,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
@@ -504,7 +549,13 @@ class CodexAppServerSession:
         `turn/completed`, fast-fail and mark the session for retirement.
         Mirrors openclaw beta.8's post-tool completion watchdog (#81697)
         so a wedged codex doesn't burn the full turn deadline.
+
+        turn_timeout: wall clock for the whole turn. ``None`` (the default)
+        resolves ``HERMES_CODEX_TURN_TIMEOUT`` and falls back to 600s, so an
+        explicit caller argument still wins and existing callers are unchanged.
         """
+        if turn_timeout is None:
+            turn_timeout = _codex_turn_timeout_default()
         # Pre-create the result so startup failures (codex subprocess can't
         # spawn, initialize handshake rejects, thread/start blows up) surface
         # the same way per-turn failures do — with a TurnResult.error string
