@@ -213,6 +213,26 @@ def _clamp_responses_call_id(call_id: str) -> str:
     return f"call_{digest}"
 
 
+# The Responses API also constrains function NAMES:
+#   "Invalid 'input[1].name': string does not match pattern.
+#    Expected a string that matches the pattern '^[a-zA-Z0-9_-]+$'."
+# Hermes' MCP tool names are DOTTED (measured in real sessions:
+# mcp.devdocs.notion_search, mcp.hermes-tools.skill_view, mcp.node_repl.js),
+# and a dot is not in that class. Observed live again 2026-07-29 05:09 UTC.
+# Sibling of _clamp_responses_call_id above; same reason, different field.
+_RESPONSES_NAME_ALLOWED = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def _sanitize_responses_tool_name(name: str) -> str:
+    """Coerce a tool name into the Responses API's allowed character class.
+
+    MUST be pure and deterministic: it is applied independently to the tool
+    DEFINITIONS and to the function_call items replayed from history, and the
+    two only stay correlated if both map the same input to the same output.
+    """
+    return _RESPONSES_NAME_ALLOWED.sub("_", name)
+
+
 def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
     """Split a stored tool id into (call_id, response_item_id)."""
     if not isinstance(raw_id, str):
@@ -569,7 +589,7 @@ def _chat_messages_to_responses_input(
                         items.append({
                             "type": "function_call",
                             "call_id": _clamp_responses_call_id(call_id),
-                            "name": fn_name,
+                            "name": _sanitize_responses_tool_name(fn_name),
                             "arguments": arguments,
                         })
                 continue
@@ -656,7 +676,7 @@ def _preflight_codex_input_items(
                 {
                     "type": "function_call",
                     "call_id": call_id.strip(),
-                    "name": name.strip(),
+                    "name": _sanitize_responses_tool_name(name.strip()),
                     "arguments": arguments,
                 }
             )
@@ -906,6 +926,9 @@ def _preflight_codex_api_kwargs(
                 raise ValueError(f"Codex Responses tools[{idx}] is missing a valid name.")
             if not isinstance(parameters, dict):
                 raise ValueError(f"Codex Responses tools[{idx}] is missing valid parameters.")
+            # Same sanitizer as the replayed function_call items, so a dotted
+            # MCP name maps to one identical legal name on BOTH sides.
+            name = _sanitize_responses_tool_name(name.strip())
 
             description = tool.get("description", "")
             if description is None:

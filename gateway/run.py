@@ -3130,6 +3130,17 @@ def _normalize_empty_agent_response(
     leaving the platform with nothing to send. (#31884)
     """
     if response:
+        # A truncated turn HAS text, but that text is the last thing the model
+        # said while still working — not an answer. Delivering it bare reads as
+        # a normal reply and is how a mid-work note reached Slack as the final
+        # word (2026-07-28, 12:14 and 19:31).
+        if agent_result.get("truncated"):
+            return (
+                f"{response}\n\n"
+                "⚠️ This turn was cut off by the run deadline — the text above "
+                "is where I got to, not a finished answer. Say \"continue\" to "
+                "pick it up."
+            )
         return response
 
     if agent_result.get("failed"):
@@ -23114,6 +23125,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the run produced no text.
                     "failure_reason": result.get("failure_reason"),
                     "partial": result.get("partial", False),
+                    "truncated": result.get("truncated", False),
                     "completed": result.get("completed"),
                     "interrupted": result.get("interrupted", False),
                     "interrupt_message": result.get("interrupt_message"),
@@ -23239,6 +23251,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "completed": result_holder[0].get("completed") if result_holder[0] else None,
                 "interrupted": result_holder[0].get("interrupted", False) if result_holder[0] else False,
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
+                # Carried so _normalize_empty_agent_response can label a
+                # deadline-truncated reply instead of shipping it as final.
+                "truncated": result_holder[0].get("truncated", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
                 # Soft lock-contention defer (#69870 consumer): distinct from

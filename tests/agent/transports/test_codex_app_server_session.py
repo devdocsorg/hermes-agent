@@ -620,6 +620,52 @@ class TestRunTurn:
         assert r.interrupted is True
         assert r.error and "timed out" in r.error
 
+    def test_deadline_after_assistant_message_is_marked_truncated(self):
+        """Replays the 2026-07-28 production bug (Slack 12:14 and 19:31).
+
+        Codex emitted an assistant message and kept working; the deadline fired
+        before turn/completed. The old code set turn_complete=True and left
+        error=None, so codex_runtime reported completed=True/partial=False and
+        the gateway posted a mid-work note as the final answer.
+        """
+        client = FakeClient()
+        for idx, text in enumerate(
+            (
+                "Looking up the thread metadata",
+                "The Slack API search scope is unavailable",
+                "I'm using the authenticated Slack web session to locate the "
+                "parent message, then I'll return to the API",
+            ),
+            start=1,
+        ):
+            client.queue_notification(
+                "item/completed",
+                item={"type": "agentMessage", "id": f"m{idx}", "text": text},
+                threadId="t", turnId="tu1",
+            )
+        # Deterministic clock: each poll advances 30s against a 100s budget, so
+        # the last message lands 10s before the deadline and codex is provably
+        # still active when it fires. NO turn/completed — that is the bug.
+        clock = {"now": 0.0}
+        real_take = client.take_notification
+
+        def ticking_take(timeout: float = 0.0):
+            clock["now"] += 30.0
+            return real_take(0.0)
+
+        client.take_notification = ticking_take
+        s = make_session(client)
+        with patch.object(
+            session_mod.time, "monotonic", side_effect=lambda: clock["now"]
+        ):
+            r = s.run_turn("do the thing", turn_timeout=100.0,
+                           notification_poll_timeout=0.01)
+
+        assert "authenticated Slack web session" in r.final_text
+        assert r.truncated is True
+        assert r.error and "truncated" in r.error
+        assert r.should_retire is True
+
     def test_deadline_uses_monotonic_clock(self):
         client = FakeClient()
         s = make_session(client)
@@ -1291,7 +1337,13 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        # Coupled to the number of time.monotonic() calls run_turn makes:
+        # deadline, last_activity_at init, loop check, last_activity_at on the
+        # notification, last_tool_completion_at, loop check, watchdog. Only the
+        # first (deadline base) and last (watchdog "now") carry meaning.
+        monotonic_values = iter(
+            [1000.0, 999.0, 999.0, 999.0, 999.0, 999.0, 1000.2]
+        )
         with patch.object(
             session_mod.time,
             "monotonic",
