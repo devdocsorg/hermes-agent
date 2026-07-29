@@ -32,7 +32,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 # Add parent directory to path for imports BEFORE repo-level imports.
 # Without this, standalone invocations (e.g. after `hermes update` reloads
@@ -288,6 +288,78 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
 SILENT_MARKER = "[SILENT]"
+SCHEDULED_RUN_ACK_PREFIX = "SCHEDULED_RUN_ACK "
+
+
+def _prepend_cron_codex_envelope(
+    prompt: str,
+    *,
+    job_id: str,
+    job_name: str,
+    run_id: str,
+) -> str:
+    """Put stable scheduler identity before skill-expanded prompt text."""
+    ack_template = json.dumps(
+        {
+            "scheduler": "hermes-cron",
+            "scheduler_id": job_id,
+            "run_id": run_id,
+            "inherited_thread_ids": [],
+            "status": "resolved",
+            "unresolved": [],
+        },
+        separators=(",", ":"),
+    )
+    return (
+        f"Hermes Cron: {job_name}\n"
+        f"Hermes Cron Job ID: {job_id}\n"
+        f"Hermes Cron Run ID: {run_id}\n"
+        "Hermes Cron Carry-Forward Contract:\n"
+        "- This run is the successor for the same stable job ID.\n"
+        "- When a scheduled-run supervisor message lists predecessor thread IDs, "
+        "inspect its evidence, continue every safely actionable unfinished item, "
+        "and do not claim resolution for work that remains blocked or pending.\n"
+        "- End with exactly one machine-readable acknowledgment line. Include every "
+        "predecessor thread ID supplied by the supervisor, the status "
+        "`resolved`, `carried-forward`, or `blocked`, and concise unresolved reasons.\n"
+        f"- A no-op response must be `{SILENT_MARKER}` followed by the acknowledgment "
+        "line; Hermes removes the acknowledgment before delivery.\n"
+        f"{SCHEDULED_RUN_ACK_PREFIX}{ack_template}\n\n"
+        f"{prompt}"
+    )
+
+
+def _strip_valid_scheduled_run_ack(
+    text: str,
+    *,
+    job_id: str,
+    run_id: str,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Remove a valid cron acknowledgment from user-facing delivery text."""
+    kept: list[str] = []
+    acknowledgment: Optional[dict[str, Any]] = None
+    for line in str(text or "").splitlines():
+        if not line.startswith(SCHEDULED_RUN_ACK_PREFIX):
+            kept.append(line)
+            continue
+        try:
+            value = json.loads(line[len(SCHEDULED_RUN_ACK_PREFIX):])
+        except (json.JSONDecodeError, TypeError):
+            kept.append(line)
+            continue
+        if (
+            not isinstance(value, dict)
+            or value.get("scheduler") != "hermes-cron"
+            or value.get("scheduler_id") != job_id
+            or value.get("run_id") != run_id
+            or value.get("status") not in {"resolved", "carried-forward", "blocked"}
+            or not isinstance(value.get("inherited_thread_ids"), list)
+            or not isinstance(value.get("unresolved"), list)
+        ):
+            kept.append(line)
+            continue
+        acknowledgment = value
+    return "\n".join(kept).strip(), acknowledgment
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
 # intentionally looser than the gateway's exact-whole-response rule: the cron
@@ -484,6 +556,25 @@ class _ReadWriteLock:
 # Serializes the per-job TERMINAL_CWD override against every other concurrently
 # running cron job.  See _ReadWriteLock and run_job for the usage contract.
 _terminal_cwd_lock = _ReadWriteLock()
+
+# ``run_one_job`` installs this context-local hook before calling ``run_job``.
+# The hook transitions the durable execution ledger from claimed -> running
+# only when ``run_job`` is about to perform real work: immediately before a
+# script, or after the workdir-isolation queue for an agent-only job. A
+# ContextVar preserves run_job's long-standing public/test-double signature and
+# remains isolated across the scheduler's parallel worker threads.
+_execution_started_callback: contextvars.ContextVar[Optional[Callable[[], None]]] = (
+    contextvars.ContextVar("cron_execution_started_callback", default=None)
+)
+
+
+def _notify_cron_execution_started() -> None:
+    """Invoke the current execution-start hook at most once, if installed."""
+    callback = _execution_started_callback.get()
+    if callback is None:
+        return
+    _execution_started_callback.set(None)
+    callback()
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -2766,6 +2857,12 @@ def run_job(
     guard). When ``None`` (the default) teardown happens inline as before, so
     every existing caller is unchanged.
 
+    ``run_one_job`` installs a context-local execution-start hook. Script-backed
+    jobs trigger it immediately before their script starts; agent jobs without
+    a script trigger it after acquiring the global TERMINAL_CWD isolation lock.
+    This keeps the durable ledger in ``claimed`` until real work begins, without
+    changing this function's public signature.
+
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
@@ -2810,6 +2907,7 @@ def run_job(
             _job_workdir = None
 
         try:
+            _notify_cron_execution_started()
             ok, output = _run_job_script_with_claim_heartbeat(
                 job, script_path, workdir=_job_workdir,
             )
@@ -2958,6 +3056,7 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
+        _notify_cron_execution_started()
         prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
         _ran_ok, _script_output = prerun_script
         if _ran_ok and not _parse_wake_gate(_script_output):
@@ -2973,6 +3072,7 @@ def run_job(
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
     except CronPromptInjectionBlocked as block_exc:
@@ -3001,8 +3101,13 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    prompt = _prepend_cron_codex_envelope(
+        prompt,
+        job_id=job_id,
+        job_name=job_name,
+        run_id=_cron_session_id,
+    )
     origin = _resolve_origin(job)
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3117,6 +3222,7 @@ def run_job(
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     try:
+        _notify_cron_execution_started()
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3508,6 +3614,7 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        agent.codex_thread_name = f"Hermes Cron: {job_name}"[:160]
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -3678,6 +3785,17 @@ def run_job(
             )
 
         final_response = result.get("final_response", "") or ""
+        final_response, scheduled_run_ack = _strip_valid_scheduled_run_ack(
+            final_response,
+            job_id=job_id,
+            run_id=_cron_session_id,
+        )
+        if scheduled_run_ack is None:
+            logger.warning(
+                "Job '%s': final response omitted a valid %s acknowledgment",
+                job_id,
+                SCHEDULED_RUN_ACK_PREFIX.strip(),
+            )
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -3915,9 +4033,11 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             )
             return True  # not an error — already handled/removed
 
-        # The attempt is claimed durably before executor/provider dispatch and
-        # becomes running only immediately before the actual run.
-        mark_execution_running(execution_id)
+        # Keep the durable attempt in ``claimed`` until real work begins.
+        # ``run_job`` calls this hook immediately before any script, or after
+        # crossing TERMINAL_CWD isolation for an agent job without a script.
+        def _mark_execution_started() -> None:
+            mark_execution_running(execution_id)
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -3943,9 +4063,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # below once delivery is done. Defense-in-depth alongside the
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
+        _started_callback_token = _execution_started_callback.set(
+            _mark_execution_started
+        )
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job,
+                defer_agent_teardown=_deferred_agents,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -3957,6 +4081,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 _teardown_cron_agent(_deferred_agent, job["id"])
             raise
         finally:
+            _execution_started_callback.reset(_started_callback_token)
             reset_secret_scope(_scope_token)
 
         # Everything from here through delivery runs with the agent still live

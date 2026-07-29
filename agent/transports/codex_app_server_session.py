@@ -281,6 +281,7 @@ class CodexAppServerSession:
         cwd: Optional[str] = None,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        thread_name: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -290,6 +291,7 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._thread_name = str(thread_name or "").strip() or None
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -368,6 +370,20 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        if self._thread_name:
+            try:
+                self._client.request(
+                    "thread/name/set",
+                    {"threadId": self._thread_id, "name": self._thread_name},
+                    timeout=10,
+                )
+            except (CodexAppServerError, TimeoutError) as exc:
+                logger.warning(
+                    "codex app-server thread naming failed: id=%s name=%r error=%s",
+                    self._thread_id[:8],
+                    self._thread_name,
+                    exc,
+                )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
             self._thread_id[:8],

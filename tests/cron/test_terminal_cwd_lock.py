@@ -134,6 +134,67 @@ def test_reader_never_observes_writer_override():
     assert observations == ["<scheduler>"]
 
 
+def test_run_job_reports_started_only_after_cwd_lock_acquired(tmp_path, monkeypatch):
+    """Queued cron work stays claimed until it crosses workdir isolation."""
+    from unittest.mock import MagicMock, patch
+    import cron.scheduler as sched
+
+    workdir = tmp_path / "proj"
+    workdir.mkdir()
+    job = {
+        "id": "queued-job",
+        "name": "queued",
+        "prompt": "hi",
+        "workdir": str(workdir),
+    }
+    lock = sched._ReadWriteLock()
+    monkeypatch.setattr(sched, "_terminal_cwd_lock", lock)
+    lock.acquire_read()  # block the workdir job's writer acquisition
+
+    writer_attempted = threading.Event()
+    real_acquire_write = lock.acquire_write
+
+    def acquire_write_with_signal():
+        writer_attempted.set()
+        real_acquire_write()
+
+    monkeypatch.setattr(lock, "acquire_write", acquire_write_with_signal)
+    started = threading.Event()
+    finished = threading.Event()
+
+    def on_started():
+        started.set()
+        raise RuntimeError("stop after crossing the queue boundary")
+
+    def target():
+        token = sched._execution_started_callback.set(on_started)
+        try:
+            sched.run_job(job)
+        finally:
+            sched._execution_started_callback.reset(token)
+            finished.set()
+
+    with patch("cron.scheduler._hermes_home", tmp_path), \
+         patch("cron.scheduler._resolve_origin", return_value=None), \
+         patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+         patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+         patch("hermes_state.SessionDB", return_value=MagicMock()):
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+        assert writer_attempted.wait(timeout=5), (
+            "run_job never attempted to enter workdir isolation"
+        )
+        assert not started.is_set(), (
+            "execution was reported running before the workdir lock was acquired"
+        )
+        lock.release_read()
+        assert started.wait(timeout=5), "execution never crossed the queue boundary"
+        assert finished.wait(timeout=5), "run_job did not unwind after callback failure"
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
 def test_run_job_releases_cwd_lock_when_body_raises(tmp_path):
     """A workdir job whose run_job body raises must still RELEASE the writer lock.
 

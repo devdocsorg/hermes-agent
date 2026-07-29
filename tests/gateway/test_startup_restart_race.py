@@ -89,6 +89,13 @@ def make_startup_runner(tmp_path):
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()
     runner.session_store.suspend_recently_active.return_value = 0
+    # The production async facade deliberately offloads sync storage calls to
+    # a thread. This race test is about platform-connect lifecycle, not executor
+    # scheduling; use a real awaitable stub so host load cannot consume its
+    # two-second race budget before platform setup begins.
+    runner._async_session_store = MagicMock()
+    runner._async_session_store._store = runner.session_store
+    runner._async_session_store.suspend_recently_active = AsyncMock(return_value=0)
     runner.delivery_router = MagicMock()
     runner.delivery_router.adapters = {}
 
@@ -166,8 +173,13 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
 
     telegram.disconnect = disconnect_and_release
     runner._create_adapter = MagicMock(side_effect=[telegram, slack])
+    # Preserve the production child-task/asyncio.wait connect path with a
+    # nonzero timeout. The suite's subprocess isolation remains the outer hang
+    # guard; adding a competing local wait_for() timer here can cancel start()
+    # before it processes an already-completed adapter task under host load.
+    runner._platform_connect_timeout_secs = MagicMock(return_value=30)
 
-    result = await asyncio.wait_for(runner.start(), timeout=2)
+    result = await runner.start()
 
     assert result is True
     assert telegram.disconnected is True
