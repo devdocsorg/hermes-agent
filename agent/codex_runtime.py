@@ -27,6 +27,81 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 
 logger = logging.getLogger(__name__)
 
+# The exit reason a codex goal-budget abandonment reports. It reuses the
+# `max_iterations_reached(` PREFIX on purpose: gateway/run.py's
+# `_automatic_continuation_for_result` gates recovery on exactly that prefix,
+# and shipping a new prefix without widening that gate would produce an
+# incomplete turn that nothing re-drives — strictly worse than today, because
+# the resume_pending / restart-counter paths would then fire with no recovery.
+CODEX_GOAL_BUDGET_EXIT_REASON = "max_iterations_reached(codex_goal_budget)"
+
+_GOAL_BUDGET_MARKER = "has reached its token budget"
+_GOAL_CONTEXT_PREFIX = '<codex_internal_context source="goal">'
+
+
+def _find_codex_rollout(thread_id: str | None) -> str | None:
+    """Path of the codex rollout JSONL for *thread_id*, or None."""
+    if not thread_id:
+        return None
+    import glob as _glob
+
+    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    matches = _glob.glob(
+        os.path.join(home, "sessions", "*", "*", "*", f"rollout-*-{thread_id}.jsonl")
+    )
+    return matches[0] if matches else None
+
+
+def codex_completion_fields(
+    *, interrupted: bool, error: object, goal_budget_limited: bool
+) -> dict:
+    """The `completed`/`turn_exit_reason` half of the codex turn result.
+
+    Extracted as a pure function ONLY so the coupling is testable: the bug this
+    guards against is `completed` silently losing the `goal_budget_limited`
+    term, which changes no syntax and no other behaviour, so nothing else in
+    the suite would notice.
+    """
+    fields: dict = {"completed": not interrupted and error is None and not goal_budget_limited}
+    if goal_budget_limited:
+        fields["turn_exit_reason"] = CODEX_GOAL_BUDGET_EXIT_REASON
+    return fields
+
+
+def _turn_abandoned_for_goal_budget(
+    rollout_path: str | None, offset: int
+) -> bool:
+    """Did codex abandon THIS turn because its goal ran out of token budget?
+
+    Reads only the bytes the turn appended (``offset`` onward). The match is
+    STRUCTURAL, not a substring scan: a rollout also stores user text, tool
+    output and assistant text, so a turn that merely *quotes* the marker — this
+    very session did, while investigating it — must not mark itself abandoned.
+    Only codex's own injected `role: user` message with the
+    `<codex_internal_context source="goal">` envelope counts.
+    """
+    if not rollout_path:
+        return False
+    with open(rollout_path, errors="replace") as fh:
+        fh.seek(offset)  # THIS TURN ONLY
+        for line in fh:
+            if _GOAL_BUDGET_MARKER not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("type") != "response_item":
+                continue
+            payload = rec.get("payload") or {}
+            if payload.get("type") != "message" or payload.get("role") != "user":
+                continue
+            frags = payload.get("content") or []
+            text = frags[0].get("text", "") if frags and isinstance(frags[0], dict) else ""
+            if text.lstrip().startswith(_GOAL_CONTEXT_PREFIX):
+                return True
+    return False
+
 
 def _coerce_usage_int(value: Any) -> int:
     if isinstance(value, bool):
@@ -696,6 +771,30 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    # A codex turn can be ABANDONED rather than answered: the model calls
+    # codex's `create_goal` with a `token_budget`, codex charges the goal the
+    # uncached input plus output of the very call that created it, marks the
+    # goal `budget_limited`, and injects
+    #   <codex_internal_context source="goal">The active thread goal has
+    #    reached its token budget ... do not start new substantive work
+    # The model then writes a checkpoint. To every layer above this transport
+    # that is indistinguishable from a finished answer: turn.error is None,
+    # turn.interrupted is False, and final_text is non-empty. Measured
+    # 2026-07-29 (thread 019fae02): a self-set 12,000 budget was charged 22,101
+    # tokens by its own creating call, and the operator got
+    # "I couldn't complete this run within the execution budget" with no
+    # transcript fetched and no PDF built.
+    #
+    # A rollout is per-THREAD and accumulates across every turn, so scanning
+    # the whole file would mark every later turn abandoned forever (thread
+    # 019f777d has 112 turns AFTER its budget marker). Remember where THIS turn
+    # starts and read only what it adds.
+    _rollout_path = _find_codex_rollout(getattr(agent._codex_session, "_thread_id", None))
+    try:
+        _rollout_offset = os.path.getsize(_rollout_path) if _rollout_path else 0
+    except OSError:
+        _rollout_offset = 0
+
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -865,11 +964,64 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    # Was this turn abandoned on a codex goal budget rather than answered?
+    # Both failure paths below log at WARNING and leave the flag False, so a
+    # detector that cannot run degrades to today's behaviour (an abandonment
+    # reported as an answer) rather than to a false abandonment.
+    _goal_budget_limited = False
+    if turn.final_text and turn.error is None and not turn.interrupted:
+        try:
+            _path = _find_codex_rollout(turn.thread_id) or _rollout_path
+            if not _path:
+                logger.warning(
+                    "codex goal-budget detector found NO rollout for thread %s "
+                    "— the abandonment check did not run this turn",
+                    turn.thread_id,
+                )
+            else:
+                _goal_budget_limited = _turn_abandoned_for_goal_budget(
+                    _path, _rollout_offset
+                )
+                if _goal_budget_limited:
+                    logger.warning(
+                        "codex ABANDONED turn %s on thread %s: its goal hit the "
+                        "token budget and it wrote a checkpoint instead of an "
+                        "answer — reporting the turn INCOMPLETE so the gateway "
+                        "re-drives it",
+                        turn.turn_id,
+                        turn.thread_id,
+                    )
+                    # The budget is a property of the THREAD's goal, not of the
+                    # turn: codex's own guidance in the injected context is
+                    # "Starting a new task is the only way to continue". Drop
+                    # the session so the gateway's continuation respawns a
+                    # fresh, goal-free thread. Without this the re-drive
+                    # re-enters the budget_limited thread and reproduces the
+                    # abandonment for every one of the 3 allowed continuations.
+                    # Same shape as the crash path above, which already drops a
+                    # session it cannot trust.
+                    try:
+                        agent._codex_session.close()
+                    except Exception:
+                        logger.debug("closing budget-limited codex session raised", exc_info=True)
+                    agent._codex_session = None
+        except Exception:
+            logger.warning(
+                "codex goal-budget detector raised for thread %s — the "
+                "abandonment check did not run this turn",
+                turn.thread_id,
+                exc_info=True,
+            )
+
     return {
         "final_response": turn.final_text,
         "messages": messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
+        **codex_completion_fields(
+            interrupted=turn.interrupted,
+            error=turn.error,
+            goal_budget_limited=_goal_budget_limited,
+        ),
         "partial": turn.interrupted or turn.error is not None,
         "interrupted": _user_interrupted,
         **(
