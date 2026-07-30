@@ -6261,6 +6261,7 @@ class SlackAdapter(BasePlatformAdapter):
         # already in the session history. Uses the thread-context cache when
         # available to avoid redundant conversations.replies calls.
         reply_to_text = None
+        reply_to_author_id = None
         if thread_ts and thread_ts != ts:
             try:
                 reply_to_text = (
@@ -6271,12 +6272,28 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     or None
                 )
+                # WHO wrote the quoted text, so the gateway can mark it
+                # [unverified] the way _format_thread_context already marks
+                # thread context. Without this the reply quote is the ONE
+                # third-party channel that reaches the model unattributed:
+                # measured 2026-07-29, a sender who had been early-rejected
+                # four times still had their words injected into an authorized
+                # turn as `[Replying to: "..."]` with no marker. The parent
+                # author is already cached (_ThreadContextCache.parent_user_id),
+                # so this costs no extra API call.
+                _cached = self._thread_context_cache.get(
+                    f"{channel_id}:{thread_ts}:{team_id}"
+                )
+                reply_to_author_id = (
+                    getattr(_cached, "parent_user_id", "") or None
+                ) if _cached else None
                 if reply_to_text:
                     reply_to_text = await self._humanize_user_mentions(
                         reply_to_text, chat_id=channel_id, team_id=team_id
                     )
             except Exception:  # pragma: no cover - defensive
                 reply_to_text = None
+                reply_to_author_id = None
 
         # Humanize remaining user mentions: the bot's own mention was already
         # stripped above, so any ``<@UID>`` left in the trigger text refers to
@@ -6301,6 +6318,7 @@ class SlackAdapter(BasePlatformAdapter):
             channel_prompt=_channel_prompt,
             channel_context=channel_context,
             reply_to_text=reply_to_text,
+            reply_to_author_id=reply_to_author_id,
             auto_skill=_auto_skill,
             metadata={
                 "slack_team_id": team_id,
@@ -7433,12 +7451,32 @@ class SlackAdapter(BasePlatformAdapter):
             # authoritative input. Bot messages bypass the user-allowlist
             # check; the auth check is configured by GatewayRunner.
             trust_tag = ""
-            if not is_bot and msg_user:
+            if is_bot and not (self_bot_uid and msg_user == self_bot_uid):
+                # A THIRD-PARTY bot post is never on the human allowlist, and
+                # before this it got NO tag at all — so an app or workflow
+                # posting into a shared thread was the only third-party content
+                # the model saw presented as trusted. Any workspace member can
+                # add an app or author a Workflow Builder post, so this is
+                # reachable content even though allow_bots="none" stops a bot
+                # TRIGGERING a turn.
+                #
+                # The self-bot exclusion is checked HERE and not via
+                # ``is_self_bot_reply``: that flag requires ``not is_parent``,
+                # so a thread whose ROOT we posted ourselves (the
+                # _bot_authored_thread_root case, #63530) would otherwise have
+                # our own message tagged [unverified] — telling the agent to
+                # distrust itself.
+                trust_tag = "[unverified] "
+            elif msg_user:
                 is_authorized = self._is_sender_authorized(
                     msg_user, chat_type="thread", chat_id=channel_id,
                 )
                 if is_authorized is False:
                     trust_tag = "[unverified] "
+            else:
+                # No author at all: unverified by default, never trusted by
+                # omission.
+                trust_tag = "[unverified] "
 
             if is_self_bot_reply:
                 # Skip user-name resolution for self-bot replies — the

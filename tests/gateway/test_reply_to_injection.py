@@ -178,5 +178,11 @@ async def test_reply_snippet_truncated_to_500_chars():
     )
 
     assert result is not None
-    assert result.startswith('[Replying to: "' + "x" * 500 + '"]')
+    # The snippet is now produced by neutralize_untrusted_inline_text, which
+    # MARKS a truncation ("..." in the last 3 chars) instead of clipping
+    # silently at [:500]. An unmarked clip reads as the whole message, which is
+    # the same lie as an unmarked narrowed capture — so the marker is kept and
+    # this assertion tracks it. The BOUND is unchanged and still pinned below.
+    assert result.startswith('[Replying to: "' + "x" * 497 + '..."]')
     assert "x" * 501 not in result
+    assert "x" * 498 not in result, "the 500-char budget must still bound the quote"
