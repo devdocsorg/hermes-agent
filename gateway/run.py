@@ -28,6 +28,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import faulthandler
+import hashlib
 import inspect
 import json
 import logging
@@ -6212,6 +6213,100 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    @staticmethod
+    def _drain_queued_path(session_key: str) -> Path:
+        """Durable landing spot for one drain-queued message, keyed by session.
+
+        Named by a hash of the session_key rather than the key itself: session
+        keys carry chat ids and thread timestamps, and a filename is the one
+        place that text is not escaped.
+        """
+        digest = hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+        return _hermes_home / "state" / "drain-queued" / f"{digest}.json"
+
+    def _persist_drain_queued(self, session_key: str, event: MessageEvent) -> bool:
+        """Write a drain-queued message to disk so a restart cannot lose it.
+
+        The in-process queue (``adapter._pending_messages`` and the overflow
+        tail) dies with the process, which is why the "queued for the next turn"
+        reply was unkeepable. This is the durable half; the replay half lives in
+        ``_schedule_resume_pending_sessions``, which already owns adapter
+        readiness, the authorization re-check and slot claiming.
+
+        Text only. Media is deliberately NOT persisted: the URLs are
+        short-lived and re-fetching them on a later boot is a different feature
+        with its own failure modes. A media message still queues in-process and
+        still gets its acknowledgement; it simply is not promised across a
+        restart. Returns whether a durable record was written.
+        """
+        text = (getattr(event, "text", "") or "").strip()
+        if not text:
+            return False
+        if getattr(event, "media_urls", None):
+            return False
+        try:
+            path = self._drain_queued_path(session_key)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            src = event.source
+            atomic_json_write(
+                path,
+                {
+                    "session_key": session_key,
+                    "text": text,
+                    "queued_at": time.time(),
+                    "platform": getattr(src.platform, "value", str(src.platform)),
+                    "chat_id": src.chat_id,
+                    "user_id": src.user_id,
+                },
+                indent=None,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("Could not persist drain-queued message for %s: %s", session_key, exc)
+            return False
+
+    def _take_drain_queued(self, session_key: str, *, max_age_seconds: float = 86400.0) -> str:
+        """Consume the durable drain-queued text for a session, if any.
+
+        DELETES before returning, so a replay is attempted at most once. An
+        at-least-once retry here would be worse than a loss: the message is
+        dispatched as a real user turn, and a crash loop would re-run the user's
+        instruction on every boot.
+
+        A record older than ``max_age_seconds`` is discarded rather than
+        replayed — silently acting on a day-old instruction is its own failure.
+        """
+        path = self._drain_queued_path(session_key)
+        try:
+            if not path.exists():
+                return ""
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            try:
+                path.unlink()
+            except Exception:
+                pass
+            return ""
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        queued_at = data.get("queued_at") or 0
+        age = time.time() - float(queued_at or 0)
+        if queued_at and age > max_age_seconds:
+            logger.warning(
+                "Discarding drain-queued message for %s: %.0fs old (limit %.0fs)",
+                session_key, age, max_age_seconds,
+            )
+            return ""
+        text = (data.get("text") or "").strip()
+        if text:
+            logger.info(
+                "Replaying drain-queued message for %s (%d chars, queued %.0fs ago)",
+                session_key, len(text), age,
+            )
+        return text
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -6315,7 +6410,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                # The in-process queue above dies with this process, so on its
+                # own the reply below is a promise nothing can keep. Persist the
+                # text and mark the session resumable so the next boot's
+                # auto-resume actually delivers it. Only claim "queued" when a
+                # durable record really exists — an unkeepable promise is worse
+                # than an honest refusal.
+                durable = self._persist_drain_queued(session_key, event)
+                if durable:
+                    try:
+                        self.session_store.mark_resume_pending(session_key, "drain_queued")
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not mark %s resumable for drain replay: %s", session_key, exc
+                        )
+                        durable = False
+                if durable:
+                    message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                else:
+                    message = (
+                        f"⏳ Gateway {self._status_action_gerund()} and cannot hold this message "
+                        "across the restart — please resend it once I'm back."
+                    )
             else:
                 message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
 
@@ -7667,6 +7783,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Bounded by the same freshness window and restart-loop breaker as
             # every other reason here.
             "max_iterations",
+            # A message that arrived DURING the shutdown drain and was answered
+            # with "queued for the next turn after it comes back". Before this
+            # existed, that reply was a promise no code in the repo could keep:
+            # the queue was two in-process dicts, the disk hook wrote a
+            # transcript row and never dispatched, and "Flushed N pending
+            # message(s)" appears zero times in any log on this host. Measured
+            # 2026-07-29: the operator's 07:45:08 Slack message was acknowledged
+            # at 07:45:12 and no turn ever ran for it.
+            "drain_queued",
         }
     )
 
@@ -8032,14 +8157,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._running_agents_ts[entry.session_key] = time.time()
             self._persist_active_agents()
 
-            # Empty-text internal event — the _is_resume_pending branch in
-            # _handle_message_with_agent prepends the proper reason-aware
-            # system note before the turn runs.
+            # Normally an empty-text internal event — the _is_resume_pending
+            # branch in _handle_message_with_agent prepends the proper
+            # reason-aware system note before the turn runs.
+            #
+            # EXCEPT when a message was queued during the drain: that text is
+            # the whole reason the user was told "queued for the next turn after
+            # it comes back", so deliver it. build_resume_recovery_note already
+            # switches to "Address the user's NEW message below FIRST" whenever
+            # message is non-empty, so carrying the text is all that is needed.
+            # Consuming here (not earlier) means the replay inherits this
+            # function's adapter-readiness and authorization checks for free.
+            queued_text = self._take_drain_queued(entry.session_key)
             event = MessageEvent(
-                text="",
+                text=queued_text,
                 message_type=MessageType.TEXT,
                 source=source,
-                internal=True,
+                internal=not queued_text,
             )
             task = asyncio.create_task(
                 self._run_startup_resume_event(adapter, event, entry.session_key)
