@@ -249,11 +249,25 @@ def build_turn_context(
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-    # Track memory nudge trigger (turn-based, checked here).
+    # Track memory nudge trigger (turn-based, checked here). Canonical DevDocs
+    # Memory is MCP-backed and therefore has no local ``_memory_store``. Treat
+    # its capture+search pair as a complete Memory surface so the existing
+    # review cadence works for production profiles without enabling local
+    # MEMORY.md writes.
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
-            and "memory" in agent.valid_tool_names
-            and agent._memory_store):
+    _local_memory_available = (
+        "memory" in agent.valid_tool_names and agent._memory_store
+    )
+    try:
+        from agent.background_review_memory import canonical_memory_tools_available
+
+        _canonical_memory_available = canonical_memory_tools_available(agent)
+    except Exception:
+        _canonical_memory_available = False
+    if (
+        agent._memory_nudge_interval > 0
+        and (_local_memory_available or _canonical_memory_available)
+    ):
         agent._turns_since_memory += 1
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             should_review_memory = True

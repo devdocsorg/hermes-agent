@@ -128,3 +128,66 @@ def test_removed_or_replaced_relabels_by_target():
 
     assert "User profile updated" in actions
     assert "Memory updated" in actions
+
+
+def test_canonical_personal_memory_capture_is_summarized():
+    review_messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "canonical-memory",
+                    "function": {
+                        "name": "mcp_devdocs_memory_capture",
+                        "arguments": json.dumps(
+                            {
+                                "body": "User prefers concise engineering updates.",
+                                "ownership": "personal",
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        _tool_msg(
+            "canonical-memory",
+            {
+                "result": (
+                    "Saved memory\n\n"
+                    '{"id":"memory-1","ownership":{"kind":"personal"}}'
+                )
+            },
+        ),
+    ]
+
+    assert _summarize(review_messages, []) == ["Personal Memory updated"]
+
+
+def test_duplicate_canonical_capture_is_not_reported_as_a_write():
+    review_messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "canonical-memory",
+                    "function": {
+                        "name": "mcp_devdocs_memory_capture",
+                        "arguments": json.dumps(
+                            {"body": "User prefers concise engineering updates."}
+                        ),
+                    },
+                }
+            ],
+        },
+        _tool_msg(
+            "canonical-memory",
+            {
+                "success": True,
+                "skipped": True,
+                "reason": "duplicate",
+                "message": "Equivalent Personal Memory already exists.",
+            },
+        ),
+    ]
+
+    assert _summarize(review_messages, []) == []

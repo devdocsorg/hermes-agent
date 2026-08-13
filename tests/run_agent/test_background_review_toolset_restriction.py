@@ -135,6 +135,55 @@ def test_background_review_installs_thread_local_whitelist():
     assert "execute_code" not in whitelist
 
 
+def test_background_review_whitelist_allows_only_canonical_memory_mcp_tools():
+    """Canonical Memory is the sole MCP capability admitted to the review."""
+    import run_agent
+    from hermes_cli import plugins as _plugins
+
+    captured = {}
+
+    def _capture_whitelist(whitelist, deny_msg_fmt=None):
+        captured["whitelist"] = set(whitelist)
+        raise RuntimeError("stop after capturing whitelist")
+
+    agent = _make_agent_stub(run_agent.AIAgent)
+    agent.valid_tool_names = {
+        "mcp_devdocs_memory_capture",
+        "mcp_devdocs_memory_search",
+        "mcp_devdocs_list_connected_accounts",
+        "terminal",
+    }
+
+    def _no_init(self, *args, **kwargs):
+        return None
+
+    with patch.object(run_agent.AIAgent, "__init__", _no_init), \
+         patch.object(_plugins, "set_thread_tool_whitelist", _capture_whitelist), \
+         patch(
+             "agent.background_review_memory.canonical_memory_tools_available",
+             return_value=True,
+         ), \
+         patch(
+             "agent.background_review_memory.background_review_memory_allowed_tools",
+             return_value={
+                 "mcp_devdocs_memory_capture",
+                 "mcp_devdocs_memory_search",
+             },
+         ), \
+         patch("threading.Thread", _SyncThread):
+        agent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=True,
+            review_skills=False,
+        )
+
+    whitelist = captured["whitelist"]
+    assert "mcp_devdocs_memory_capture" in whitelist
+    assert "mcp_devdocs_memory_search" in whitelist
+    assert "mcp_devdocs_list_connected_accounts" not in whitelist
+    assert "terminal" not in whitelist
+
+
 def test_background_review_agent_tools_are_limited():
     """Verify the resolved memory+skills toolsets only contain memory and skill tools.
 

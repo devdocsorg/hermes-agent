@@ -157,14 +157,17 @@ def _digest_history(messages_snapshot: List[Dict], tail: int = 24) -> List[Dict]
 # them as class attributes (``_MEMORY_REVIEW_PROMPT`` etc.) for back-compat;
 # the actual text lives here so future edits are one-place.
 _MEMORY_REVIEW_PROMPT = (
-    "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Focus on:\n"
-    "1. Has the user revealed things about themselves — their persona, desires, "
-    "preferences, or personal details worth remembering?\n"
-    "2. Has the user expressed expectations about how you should behave, their work "
-    "style, or ways they want you to operate?\n\n"
-    "If something stands out, save it using the memory tool. "
-    "If nothing is worth saving, just say 'Nothing to save.' and stop."
+    "Review the conversation above for durable Personal Memory worth carrying "
+    "into future sessions.\n\n"
+    "Capture only concise, distilled facts such as stable preferences, explicit "
+    "decisions, working style, recurring responsibilities, and long-lived context. "
+    "Do not copy raw chats, transcripts, imported/source payloads, tool results, "
+    "credentials, secrets, sensitive personal data, transient failures, or one-off "
+    "task state.\n\n"
+    "When mcp_devdocs_memory_capture is available, use it for Personal Memory. "
+    "Never select organization/team ownership; the runtime enforces Personal scope "
+    "and performs duplicate detection. Otherwise use the local memory tool when "
+    "available. If nothing is worth saving, say 'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
@@ -398,7 +401,11 @@ def summarize_background_review_actions(
     # result JSON only says "Entry added"; the call arguments contain action,
     # target, and content previews.  Restricting to notify_tools also prevents
     # helper tools from surfacing as memory work just because they succeeded.
-    notify_tools = {"memory", "skill_manage"}
+    notify_tools = {
+        "memory",
+        "skill_manage",
+        "mcp_devdocs_memory_capture",
+    }
     all_tool_call_ids: set = set()
     call_details: dict = {}
     for msg in review_messages or []:
@@ -429,6 +436,8 @@ def summarize_background_review_actions(
                     "name": args.get("name", ""),
                     "old_string": args.get("old_string", ""),
                     "new_string": args.get("new_string", ""),
+                    "body": args.get("body", ""),
+                    "ownership": args.get("ownership", ""),
                 }
 
     actions: List[str] = []
@@ -448,10 +457,28 @@ def summarize_background_review_actions(
             data = json.loads(msg.get("content", "{}"))
         except (json.JSONDecodeError, TypeError):
             continue
-        if not isinstance(data, dict) or not data.get("success"):
+        if not isinstance(data, dict):
+            continue
+        detail = call_details.get(tcid, {})
+        is_canonical_memory = detail.get("tool") == "mcp_devdocs_memory_capture"
+        if data.get("skipped"):
+            continue
+        if is_canonical_memory:
+            if data.get("error"):
+                continue
+            result_text = data.get("result")
+            if not isinstance(result_text, str) or "Saved memory" not in result_text:
+                continue
+            if verbose:
+                body = detail.get("body", "")
+                preview = body[:120] + ("…" if len(body) > 120 else "")
+                actions.append(f"Personal Memory ➕ {preview}")
+            else:
+                actions.append("Personal Memory updated")
+            continue
+        if not data.get("success"):
             continue
         message = data.get("message", "")
-        detail = call_details.get(tcid, {})
         target = data.get("target", "") or detail.get("target", "")
         is_skill = detail.get("tool") == "skill_manage"
 
@@ -572,6 +599,8 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    *,
+    review_memory: bool = False,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -720,6 +749,11 @@ def _run_review_in_thread(
             review_agent.compression_enabled = False
 
             from model_tools import get_tool_definitions
+            from agent.background_review_memory import (
+                background_review_memory_allowed_tools,
+                canonical_memory_review_policy,
+                canonical_memory_tools_available,
+            )
             from hermes_cli.plugins import (
                 set_thread_tool_whitelist,
                 clear_thread_tool_whitelist,
@@ -732,6 +766,13 @@ def _run_review_in_thread(
                     quiet_mode=True,
                 )
             }
+            canonical_memory_enabled = (
+                review_memory and canonical_memory_tools_available(agent)
+            )
+            if canonical_memory_enabled:
+                review_whitelist.update(
+                    background_review_memory_allowed_tools(agent)
+                )
             set_thread_tool_whitelist(
                 review_whitelist,
                 deny_msg_fmt=(
@@ -747,15 +788,26 @@ def _run_review_in_thread(
                     _digest_history(messages_snapshot) if _routed
                     else messages_snapshot
                 )
-                review_agent.run_conversation(
-                    user_message=(
-                        prompt
-                        + "\n\nYou can only call memory and skill "
-                        "management tools. Other tools will be denied "
-                        "at runtime — do not attempt them."
-                    ),
-                    conversation_history=_review_history,
+                canonical_guidance = (
+                    "\n\nCanonical DevDocs Personal Memory is available as "
+                    "mcp_devdocs_memory_capture. Use it for any durable Memory "
+                    "write. The runtime forces Personal ownership, rejects unsafe "
+                    "content, searches for equivalents, and assigns an idempotent "
+                    "memory ID."
+                    if canonical_memory_enabled
+                    else ""
                 )
+                with canonical_memory_review_policy(canonical_memory_enabled):
+                    review_agent.run_conversation(
+                        user_message=(
+                            prompt
+                            + canonical_guidance
+                            + "\n\nYou can only call approved memory and skill "
+                            "management tools. Other tools will be denied at "
+                            "runtime — do not attempt them."
+                        ),
+                        conversation_history=_review_history,
+                    )
             finally:
                 clear_thread_tool_whitelist()
 
@@ -859,7 +911,12 @@ def spawn_background_review_thread(
         prompt = getattr(agent, "_SKILL_REVIEW_PROMPT", _SKILL_REVIEW_PROMPT)
 
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        _run_review_in_thread(
+            agent,
+            messages_snapshot,
+            prompt,
+            review_memory=review_memory,
+        )
 
     return _target, prompt
 

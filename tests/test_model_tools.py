@@ -201,6 +201,122 @@ class TestHandleFunctionCall:
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
 
+    def test_background_review_canonical_memory_dispatch_is_personal_and_deduplicated(
+        self, monkeypatch
+    ):
+        from agent.background_review_memory import (
+            CANONICAL_MEMORY_CAPTURE_TOOL,
+            CANONICAL_MEMORY_SEARCH_TOOL,
+            canonical_memory_review_policy,
+        )
+
+        calls = []
+        hook_calls = []
+
+        def fake_dispatch(tool_name, args, **kwargs):
+            calls.append((tool_name, dict(args), kwargs))
+            if tool_name == CANONICAL_MEMORY_SEARCH_TOOL:
+                return json.dumps(
+                    {"result": "Memory search results\n\n[]"},
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "result": (
+                        "Saved memory\n\n"
+                        + json.dumps(
+                            {
+                                "id": args["memory_id"],
+                                "body": args["body"],
+                                "ownership": {"kind": "personal"},
+                            }
+                        )
+                    )
+                },
+                ensure_ascii=False,
+            )
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+        monkeypatch.setattr("hermes_cli.middleware._has_middleware", lambda _kind: False)
+        monkeypatch.setattr(
+            "hermes_cli.middleware._get_middleware_callbacks",
+            lambda _kind: [],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
+        )
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: name == "post_tool_call")
+
+        with canonical_memory_review_policy(True):
+            result = handle_function_call(
+                CANONICAL_MEMORY_CAPTURE_TOOL,
+                {
+                    "body": "User prefers concise engineering updates.",
+                    "ownership": "organization",
+                    "organization_id": "org_123",
+                },
+                task_id="task-1",
+                tool_call_id="call-1",
+                session_id="session-1",
+            )
+
+        assert "Saved memory" in json.loads(result)["result"]
+        assert [name for name, _args, _kwargs in calls] == [
+            CANONICAL_MEMORY_SEARCH_TOOL,
+            CANONICAL_MEMORY_CAPTURE_TOOL,
+        ]
+        search_args = calls[0][1]
+        capture_args = calls[1][1]
+        assert search_args["ownership"] == "personal"
+        assert capture_args["ownership"] == "personal"
+        assert "organization_id" not in capture_args
+        assert capture_args["memory_id"]
+
+        pre_call = next(call for call in hook_calls if call[0] == "pre_tool_call")
+        post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
+        assert pre_call[1]["args"]["ownership"] == "personal"
+        assert "organization_id" not in pre_call[1]["args"]
+        assert post_call[1]["args"]["ownership"] == "personal"
+        assert post_call[1]["status"] == "ok"
+
+    def test_foreground_canonical_memory_dispatch_preserves_explicit_scope(
+        self, monkeypatch
+    ):
+        from agent.background_review_memory import CANONICAL_MEMORY_CAPTURE_TOOL
+
+        calls = []
+
+        def fake_dispatch(tool_name, args, **kwargs):
+            calls.append((tool_name, dict(args), kwargs))
+            return json.dumps({"ok": True})
+
+        monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
+        monkeypatch.setattr("hermes_cli.middleware._has_middleware", lambda _kind: False)
+        monkeypatch.setattr(
+            "hermes_cli.middleware._get_middleware_callbacks",
+            lambda _kind: [],
+        )
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_k: [])
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda _name: False)
+
+        result = handle_function_call(
+            CANONICAL_MEMORY_CAPTURE_TOOL,
+            {
+                "body": "Explicitly shared team decision.",
+                "ownership": "organization",
+                "organization_id": "org_123",
+            },
+            task_id="task-1",
+        )
+
+        assert json.loads(result) == {"ok": True}
+        assert len(calls) == 1
+        assert calls[0][0] == CANONICAL_MEMORY_CAPTURE_TOOL
+        assert calls[0][1]["ownership"] == "organization"
+        assert calls[0][1]["organization_id"] == "org_123"
+        assert "memory_id" not in calls[0][1]
+
 
 # =========================================================================
 # Agent loop tools
