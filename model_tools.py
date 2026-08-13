@@ -1039,6 +1039,24 @@ def handle_function_call(
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
 
+    # AI GUARDRAIL: unattended background-review writes to canonical DevDocs
+    # Memory are always Personal, concise, and idempotent. Foreground calls are
+    # unchanged because the policy is scoped by a ContextVar in the review fork.
+    try:
+        from agent.background_review_memory import (
+            apply_canonical_memory_request_policy,
+        )
+
+        function_args = apply_canonical_memory_request_policy(
+            function_name,
+            function_args,
+        )
+    except Exception:
+        logger.debug(
+            "background-review canonical Memory request policy skipped",
+            exc_info=True,
+        )
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
@@ -1151,6 +1169,25 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                     )
+                try:
+                    from agent.background_review_memory import (
+                        dispatch_canonical_memory_tool,
+                    )
+
+                    def _dispatch(next_args: Dict[str, Any]) -> Any:
+                        return dispatch_canonical_memory_tool(
+                            function_name,
+                            next_args,
+                            lambda nested_name, nested_args: registry.dispatch(
+                                nested_name,
+                                nested_args,
+                                task_id=task_id,
+                                session_id=session_id,
+                                user_task=user_task,
+                            ),
+                        )
+                except Exception:
+                    pass
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(

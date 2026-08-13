@@ -2440,6 +2440,76 @@ class TestConcurrentToolExecution:
         assert "beta" in messages[1]["content"]
         assert "gamma" in messages[2]["content"]
 
+    @pytest.mark.parametrize(
+        ("tool_name", "arguments"),
+        [
+            (
+                "mcp_devdocs_memory_capture",
+                '{"body":"User prefers concise engineering updates."}',
+            ),
+            (
+                "tool_call",
+                json.dumps(
+                    {
+                        "name": "mcp_devdocs_memory_capture",
+                        "arguments": {
+                            "body": "User prefers concise engineering updates.",
+                        },
+                    }
+                ),
+            ),
+        ],
+    )
+    def test_concurrent_canonical_memory_capture_resets_review_counter(
+        self, agent, monkeypatch, tool_name, arguments
+    ):
+        """Direct and Tool Search-bridged canonical captures reset cadence."""
+        agent._turns_since_memory = 5
+        tc1 = _mock_tool_call(name=tool_name, arguments=arguments, call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"one"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        if tool_name == "tool_call":
+            monkeypatch.setattr(
+                "agent.tool_executor._tool_search_scoped_names",
+                lambda _agent: frozenset({"mcp_devdocs_memory_capture"}),
+            )
+            monkeypatch.setattr(
+                "tools.tool_search.is_deferrable_tool_name",
+                lambda name: name == "mcp_devdocs_memory_capture",
+            )
+
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert agent._turns_since_memory == 0
+
+    def test_concurrent_blocked_canonical_memory_capture_keeps_review_counter(
+        self, agent, monkeypatch
+    ):
+        """A denied automatic write must remain eligible for a later review."""
+        agent._turns_since_memory = 5
+        tc1 = _mock_tool_call(
+            name="mcp_devdocs_memory_capture",
+            arguments='{"body":"User prefers concise engineering updates."}',
+            call_id="c1",
+        )
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"one"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_pre_tool_call_block_message",
+            lambda name, *_args, **_kwargs: "Blocked"
+            if name == "mcp_devdocs_memory_capture"
+            else None,
+        )
+
+        with patch("run_agent.handle_function_call", return_value='{"ok":true}'):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert agent._turns_since_memory == 5
+
     def test_concurrent_preserves_order_despite_timing(self, agent):
         """Even if tools finish in different order, messages should be in original order."""
         import time as _time

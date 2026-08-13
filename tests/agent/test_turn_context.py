@@ -184,6 +184,40 @@ def test_memory_nudge_fires_at_interval():
     assert agent._turns_since_memory == 0  # reset after firing
 
 
+def test_canonical_mcp_only_memory_fires_at_interval(monkeypatch):
+    agent = _FakeAgent()
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {
+        "mcp_devdocs_memory_capture",
+        "mcp_devdocs_memory_search",
+    }
+    monkeypatch.setattr(
+        "agent.background_review_memory.canonical_memory_tools_available",
+        lambda _agent: True,
+    )
+
+    ctx = _build(agent)
+
+    assert agent._memory_store is None
+    assert ctx.should_review_memory is True
+    assert agent._turns_since_memory == 0
+
+
+def test_incomplete_canonical_memory_surface_does_not_fire(monkeypatch):
+    agent = _FakeAgent()
+    agent._memory_nudge_interval = 1
+    agent.valid_tool_names = {"mcp_devdocs_memory_capture"}
+    monkeypatch.setattr(
+        "agent.background_review_memory.canonical_memory_tools_available",
+        lambda _agent: False,
+    )
+
+    ctx = _build(agent)
+
+    assert ctx.should_review_memory is False
+    assert agent._turns_since_memory == 0
+
+
 def test_no_review_when_memory_disabled():
     agent = _FakeAgent()
     ctx = _build(agent)
@@ -258,4 +292,3 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
-

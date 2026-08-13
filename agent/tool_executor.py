@@ -242,10 +242,28 @@ def _apply_tool_request_middleware_for_agent(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
         payload = result.payload if isinstance(result.payload, dict) else function_args
+        try:
+            from agent.background_review_memory import (
+                apply_canonical_memory_request_policy,
+            )
+
+            payload = apply_canonical_memory_request_policy(function_name, payload)
+        except Exception:
+            logger.debug(
+                "background-review canonical Memory request policy skipped",
+                exc_info=True,
+            )
         return payload, list(result.trace)
     except Exception as exc:
         logger.debug("tool_request middleware error: %s", exc)
-        return function_args, []
+        try:
+            from agent.background_review_memory import (
+                apply_canonical_memory_request_policy,
+            )
+
+            return apply_canonical_memory_request_policy(function_name, function_args), []
+        except Exception:
+            return function_args, []
 
 
 def _run_agent_tool_execution_middleware(
@@ -313,12 +331,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
     for tool_call in tool_calls:
         function_name = tool_call.function.name
-
-        # Reset nudge counters
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
 
         try:
             function_args = json.loads(tool_call.function.arguments)
@@ -437,6 +449,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
                         middleware_trace=list(middleware_trace),
                     )
+
+        if block_result is None:
+            if function_name in {"memory", "mcp_devdocs_memory_capture"}:
+                agent._turns_since_memory = 0
+            elif function_name == "skill_manage":
+                agent._iters_since_skill = 0
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -948,7 +966,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # callbacks, checkpointing, activity mutation, and real execution.
             pass
         # Reset nudge counters when the relevant tool is actually used
-        elif function_name == "memory":
+        elif function_name in {"memory", "mcp_devdocs_memory_capture"}:
             agent._turns_since_memory = 0
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
