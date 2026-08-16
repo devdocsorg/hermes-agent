@@ -15,6 +15,7 @@ from agent.background_review_memory import (
     canonical_memory_review_policy,
     canonical_memory_tools_available,
     dispatch_canonical_memory_tool,
+    redirect_local_memory_call,
 )
 
 
@@ -72,6 +73,67 @@ def test_background_search_forces_personal_scope_and_strips_organization():
         "limit": 10,
         "ownership": "personal",
     }
+
+
+def test_background_local_memory_add_routes_to_canonical_capture():
+    with canonical_memory_review_policy(True):
+        tool_name, args = redirect_local_memory_call(
+            "memory",
+            {
+                "action": "add",
+                "target": "user",
+                "content": "User prefers concise engineering updates.",
+            },
+        )
+
+    assert tool_name == CANONICAL_MEMORY_CAPTURE_TOOL
+    assert args == {
+        "body": "User prefers concise engineering updates.",
+        "tags": ["local-memory-compat", "legacy-target-user"],
+    }
+
+
+def test_background_local_memory_add_defaults_to_memory_target():
+    with canonical_memory_review_policy(True):
+        tool_name, args = redirect_local_memory_call(
+            "memory",
+            {
+                "action": "add",
+                "content": "The agent should keep concise implementation notes.",
+            },
+        )
+
+    assert tool_name == CANONICAL_MEMORY_CAPTURE_TOOL
+    assert args["tags"] == ["local-memory-compat", "legacy-target-memory"]
+
+
+def test_foreground_and_non_add_local_memory_calls_are_not_redirected():
+    foreground = {
+        "action": "add",
+        "target": "user",
+        "content": "User prefers concise engineering updates.",
+    }
+    assert redirect_local_memory_call("memory", foreground) == ("memory", foreground)
+
+    replace = {
+        "action": "replace",
+        "target": "user",
+        "old_text": "concise",
+        "content": "User prefers detailed engineering updates.",
+    }
+    with canonical_memory_review_policy(True):
+        assert redirect_local_memory_call("memory", replace) == ("memory", replace)
+
+    invalid_target = {
+        "action": "add",
+        "target": "organization",
+        "content": "The organization uses a private deployment convention.",
+    }
+    with canonical_memory_review_policy(True):
+        assert redirect_local_memory_call("memory", invalid_target) == (
+            "memory",
+            invalid_target,
+        )
 
 
 def test_unsafe_or_transient_automatic_memory_is_rejected():

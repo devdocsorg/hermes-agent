@@ -30,6 +30,7 @@ CANONICAL_MEMORY_SEARCH_TOOL = "mcp_devdocs_memory_search"
 CANONICAL_MEMORY_TOOLS = frozenset(
     {CANONICAL_MEMORY_CAPTURE_TOOL, CANONICAL_MEMORY_SEARCH_TOOL}
 )
+LOCAL_MEMORY_TOOL = "memory"
 
 _AUTO_MEMORY_NAMESPACE = uuid.UUID("cf5e3e39-2d34-4c11-85ec-c6e3648d6b0d")
 _AUTO_MEMORY_MAX_CHARS = 1200
@@ -140,6 +141,40 @@ def canonical_memory_review_policy(enabled: bool):
 
 def canonical_memory_review_policy_active() -> bool:
     return bool(_policy_active.get())
+
+
+def redirect_local_memory_call(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+) -> tuple[str, Dict[str, Any]]:
+    """Route a review fork's local-memory add through canonical Memory.
+
+    Background review keeps the parent's model-visible tool schema for provider
+    prefix-cache parity. In production, canonical MCP tools can be deferred
+    behind Tool Search while the built-in ``memory`` tool remains visible even
+    though the review fork intentionally has no local store. Translating an
+    ``add`` call here preserves the stable schema while ensuring the write
+    reaches canonical DevDocs Memory.
+    """
+    current = dict(args or {})
+    if (
+        not canonical_memory_review_policy_active()
+        or tool_name != LOCAL_MEMORY_TOOL
+    ):
+        return tool_name, current
+
+    content = current.get("content")
+    if current.get("action") != "add" or not isinstance(content, str):
+        return tool_name, current
+
+    target = _normalize_text(current.get("target", "memory"))
+    if target not in {"memory", "user"}:
+        return tool_name, current
+
+    return CANONICAL_MEMORY_CAPTURE_TOOL, {
+        "body": content,
+        "tags": ["local-memory-compat", f"legacy-target-{target}"],
+    }
 
 
 def apply_canonical_memory_request_policy(
@@ -416,4 +451,5 @@ __all__ = [
     "canonical_memory_review_policy_active",
     "canonical_memory_tools_available",
     "dispatch_canonical_memory_tool",
+    "redirect_local_memory_call",
 ]

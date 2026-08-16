@@ -164,10 +164,9 @@ _MEMORY_REVIEW_PROMPT = (
     "Do not copy raw chats, transcripts, imported/source payloads, tool results, "
     "credentials, secrets, sensitive personal data, transient failures, or one-off "
     "task state.\n\n"
-    "When mcp_devdocs_memory_capture is available, use it for Personal Memory. "
-    "Never select organization/team ownership; the runtime enforces Personal scope "
-    "and performs duplicate detection. Otherwise use the local memory tool when "
-    "available. If nothing is worth saving, say 'Nothing to save.' and stop."
+    "Use the available memory tool only to add durable context. Never replace or "
+    "remove memory in an automatic review. If nothing is worth saving, say "
+    "'Nothing to save.' and stop."
 )
 
 _SKILL_REVIEW_PROMPT = (
@@ -790,10 +789,13 @@ def _run_review_in_thread(
                 )
                 canonical_guidance = (
                     "\n\nCanonical DevDocs Personal Memory is available as "
-                    "mcp_devdocs_memory_capture. Use it for any durable Memory "
-                    "write. The runtime forces Personal ownership, rejects unsafe "
-                    "content, searches for equivalents, and assigns an idempotent "
-                    "memory ID."
+                    "mcp_devdocs_memory_capture. Call it directly when listed or "
+                    "through tool_call when deferred. If the cached schema only "
+                    "shows memory, use memory(action=\"add\", content=...); the "
+                    "runtime redirects that compatibility call to canonical Memory. "
+                    "Never replace or remove memory here. The runtime forces Personal "
+                    "ownership, rejects unsafe content, searches for equivalents, "
+                    "and assigns an idempotent memory ID."
                     if canonical_memory_enabled
                     else ""
                 )
