@@ -1713,6 +1713,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    try:
+        from agent.background_review_memory import redirect_local_memory_call
+
+        function_name, function_args = redirect_local_memory_call(
+            function_name,
+            function_args,
+        )
+    except Exception:
+        logger.debug(
+            "background-review local Memory redirect skipped",
+            exc_info=True,
+        )
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware

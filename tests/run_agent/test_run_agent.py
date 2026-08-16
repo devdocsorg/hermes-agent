@@ -2118,6 +2118,57 @@ class TestExecuteToolCalls:
         assert metadata["tool_call_id"] == "mem-1"
         assert messages[-1]["tool_call_id"] == "mem-1"
 
+    def test_background_local_memory_add_dispatches_canonical_search_and_capture(
+        self, agent
+    ):
+        from agent.background_review_memory import canonical_memory_review_policy
+
+        tc = _mock_tool_call(
+            name="memory",
+            arguments=json.dumps({
+                "action": "add",
+                "target": "user",
+                "content": "User prefers concise engineering updates.",
+            }),
+            call_id="mem-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        dispatched = []
+
+        def _dispatch(name, args, **_kwargs):
+            dispatched.append((name, dict(args)))
+            if name == "mcp_devdocs_memory_search":
+                return json.dumps({"result": "Memory search results\n\n[]"})
+            return json.dumps({
+                "result": (
+                    "Saved memory\n\n"
+                    + json.dumps({
+                        "id": args["memory_id"],
+                        "body": args["body"],
+                        "ownership": {"kind": "personal"},
+                    })
+                )
+            })
+
+        agent._memory_store = None
+        with (
+            canonical_memory_review_policy(True),
+            patch("tools.registry.registry.dispatch", side_effect=_dispatch),
+            patch("tools.memory_tool.memory_tool") as local_memory,
+        ):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert [name for name, _args in dispatched] == [
+            "mcp_devdocs_memory_search",
+            "mcp_devdocs_memory_capture",
+        ]
+        assert all(args["ownership"] == "personal" for _name, args in dispatched)
+        assert dispatched[1][1]["body"] == "User prefers concise engineering updates."
+        local_memory.assert_not_called()
+        assert messages[-1]["name"] == "mcp_devdocs_memory_capture"
+        assert "Saved memory" in messages[-1]["content"]
+
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])

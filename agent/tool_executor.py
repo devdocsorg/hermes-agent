@@ -374,6 +374,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
+        try:
+            from agent.background_review_memory import redirect_local_memory_call
+
+            function_name, function_args = redirect_local_memory_call(
+                function_name,
+                function_args,
+            )
+        except Exception:
+            logger.debug(
+                "background-review local Memory redirect skipped",
+                exc_info=True,
+            )
+
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
             function_name=function_name,
@@ -922,6 +935,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         )
         except Exception:
             pass
+
+        try:
+            from agent.background_review_memory import redirect_local_memory_call
+
+            function_name, function_args = redirect_local_memory_call(
+                function_name,
+                function_args,
+            )
+        except Exception:
+            logger.debug(
+                "background-review local Memory redirect skipped",
+                exc_info=True,
+            )
 
         function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
             agent,
