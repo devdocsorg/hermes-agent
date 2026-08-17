@@ -1451,13 +1451,19 @@ class AIAgent:
         keep working.
         """
         from agent.background_review import spawn_background_review_thread
+        from tools.thread_context import propagate_context_to_thread
+
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
         )
-        t = threading.Thread(target=target, daemon=True, name="bg-review")
+        t = threading.Thread(
+            target=propagate_context_to_thread(target),
+            daemon=True,
+            name="bg-review",
+        )
         t.start()
 
     def _build_memory_write_metadata(

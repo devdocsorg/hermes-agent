@@ -40,6 +40,42 @@ class ImmediateThread:
         self._target()
 
 
+def test_background_review_propagates_parent_contextvars(monkeypatch):
+    import contextvars
+    import agent.background_review as bg_review
+
+    marker = contextvars.ContextVar("background_review_test_marker", default=None)
+    observed = {}
+
+    class FreshContextThread:
+        def __init__(self, *, target, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            contextvars.Context().run(self._target)
+
+    def fake_spawn(*_args, **_kwargs):
+        def target():
+            observed["marker"] = marker.get()
+
+        return target, "test prompt"
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", FreshContextThread)
+    monkeypatch.setattr(bg_review, "spawn_background_review_thread", fake_spawn)
+
+    token = marker.set("parent-turn")
+    try:
+        AIAgent._spawn_background_review(
+            _bare_agent(),
+            messages_snapshot=[{"role": "user", "content": "hello"}],
+            review_memory=True,
+        )
+    finally:
+        marker.reset(token)
+
+    assert observed["marker"] == "parent-turn"
+
+
 def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     events = []
 
