@@ -153,6 +153,30 @@ def test_durable_preference_with_error_word_is_allowed():
     )
 
 
+def test_policy_rejected_review_is_a_successful_noop(caplog):
+    calls = []
+
+    def dispatch(name, args):
+        calls.append((name, dict(args)))
+        raise AssertionError("A policy-rejected capture must not reach MCP.")
+
+    with caplog.at_level(logging.INFO), canonical_memory_review_policy(True):
+        result = dispatch_canonical_memory_tool(
+            CANONICAL_MEMORY_CAPTURE_TOOL,
+            {"body": "Weather today is sunny in Austin."},
+            dispatch,
+        )
+
+    assert json.loads(result) == {
+        "success": True,
+        "skipped": True,
+        "reason": "policy",
+        "message": "Automatic Memory capture cannot store transient failures or one-off task state.",
+    }
+    assert calls == []
+    assert "capture skipped" in caplog.text
+
+
 def test_capture_searches_personal_memory_then_writes_once():
     calls = []
 

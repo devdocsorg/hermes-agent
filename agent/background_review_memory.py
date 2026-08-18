@@ -327,8 +327,16 @@ def dispatch_canonical_memory_tool(
     safe_args = apply_canonical_memory_request_policy(tool_name, args)
     block_reason = auto_memory_block_reason(safe_args.get("body"))
     if block_reason:
-        logger.warning("Background review Personal Memory capture blocked: %s", block_reason)
-        return json.dumps({"error": block_reason}, ensure_ascii=False)
+        logger.info("Background review Personal Memory capture skipped: %s", block_reason)
+        return json.dumps(
+            {
+                "success": True,
+                "skipped": True,
+                "reason": "policy",
+                "message": block_reason,
+            },
+            ensure_ascii=False,
+        )
 
     memory_id = safe_args["memory_id"]
     search_args = apply_canonical_memory_request_policy(
