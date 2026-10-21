@@ -38,7 +38,9 @@
   "overrides": {
     "lodash": "4.18.1",
     "@assistant-ui/store": "0.2.13",
-    "yauzl": "^3.3.1"
+    "yauzl": "^3.3.1",
+    "undici@6": "6.29.1",
+    "undici@7": "7.30.1"
   },
   "engines": {
     "node": ">=20.0.0"
